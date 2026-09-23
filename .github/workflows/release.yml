@@ -1,12 +1,14 @@
 name: Release synced desktop app
 
+# No push trigger: a code-only merge must never rebuild or overwrite an old
+# signed release. Upstream sync dispatches the newly merged SHA explicitly.
 on:
-  push:
-    branches: [main]
-    paths:
-      - upstream.json
   workflow_dispatch:
     inputs:
+      approved_sha:
+        description: "Reviewed main commit to release (must match HEAD of main)"
+        required: true
+        type: string
       source_pr:
         description: "Upstream sync PR that requested this release"
         required: false
@@ -15,8 +17,59 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: desktop-release
+  cancel-in-progress: false
+
 jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Require approved main and a new immutable tag and updater version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPROVED_SHA: ${{ inputs.approved_sha }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Release must target main" >&2
+            exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "$APPROVED_SHA" != "$GITHUB_SHA" ]; then
+            echo "Approval SHA does not match main's checked-out commit" >&2
+            exit 1
+          fi
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="app-v${VERSION}"
+          # Do not silently overwrite the old release even if no release
+          # object is visible yet (a draft or a leftover tag is enough).
+          if [ -n "$(git ls-remote --tags origin "refs/tags/${TAG}")" ]; then
+            echo "Release tag ${TAG} already exists; bump the desktop version first" >&2
+            exit 1
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; refusing to overwrite assets" >&2
+            exit 1
+          fi
+          # A missing latest release is valid for initial setup; any other
+          # lookup error must fail closed instead of publishing an unknown version.
+          if ! gh release view --json tagName --jq '.tagName' > latest-tag.txt; then
+            if [ -n "$(gh release list --limit 1 --json tagName --jq '.[].tagName')" ]; then
+              echo "Cannot determine latest release" >&2
+              exit 1
+            fi
+          fi
+          LATEST=$(cat latest-tag.txt 2>/dev/null || true)
+          if [ -n "$LATEST" ]; then
+            CURRENT_VERSION="$VERSION" LATEST_VERSION="${LATEST#app-v}" node --input-type=module -e '
+              import { compareVersions } from "./scripts/desktop-version.mjs";
+              if (compareVersions(process.env.CURRENT_VERSION, process.env.LATEST_VERSION) <= 0)
+                throw new Error("Desktop version must be newer than the public latest release");
+            '
+          fi
+
   release:
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:

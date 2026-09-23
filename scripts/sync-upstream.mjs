@@ -1,10 +1,8 @@
 import { readFileSync, writeFileSync } from 'node:fs';
+import { nextDesktopVersion, writeDesktopVersion } from './desktop-version.mjs';
 
 const root = new URL('../', import.meta.url);
 const manifestUrl = new URL('upstream.json', root);
-const packageUrl = new URL('package.json', root);
-const tauriConfigUrl = new URL('src-tauri/tauri.conf.json', root);
-const cargoManifestUrl = new URL('src-tauri/Cargo.toml', root);
 const manifest = JSON.parse(readFileSync(manifestUrl, 'utf8'));
 
 const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
@@ -37,26 +35,18 @@ if (release.tag_name === manifest.version) {
 }
 
 const version = release.tag_name.replace(/^v/, '');
-if (!/^\d+\.\d+\.\d+(?:[-+].+)?$/.test(version)) {
+if (!/^\d+\.\d+\.\d+$/.test(version)) {
   throw new Error(`Unsupported upstream version: ${release.tag_name}`);
 }
 
+const current = JSON.parse(readFileSync(new URL('package.json', root), 'utf8')).version;
+const desktopVersion = nextDesktopVersion(current, version);
+// Bump first: a mismatch must not leave upstream.json ahead of the desktop.
+writeDesktopVersion(desktopVersion);
 writeFileSync(manifestUrl, `${JSON.stringify({
   repository: manifest.repository,
   version: release.tag_name,
   publishedAt: release.published_at,
   releaseUrl: release.html_url,
 }, null, 2)}\n`);
-
-const packageJson = JSON.parse(readFileSync(packageUrl, 'utf8'));
-packageJson.version = version;
-writeFileSync(packageUrl, `${JSON.stringify(packageJson, null, 2)}\n`);
-
-const tauriConfig = JSON.parse(readFileSync(tauriConfigUrl, 'utf8'));
-tauriConfig.version = version;
-writeFileSync(tauriConfigUrl, `${JSON.stringify(tauriConfig, null, 2)}\n`);
-
-const cargoManifest = readFileSync(cargoManifestUrl, 'utf8');
-writeFileSync(cargoManifestUrl, cargoManifest.replace(/^version = "[^"]+"/m, `version = "${version}"`));
-
-console.log(`Synced ${manifest.version} -> ${release.tag_name}`);
+console.log(`Synced ${manifest.version} -> ${release.tag_name}; desktop ${current} -> ${desktopVersion}`);
