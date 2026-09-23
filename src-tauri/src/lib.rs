@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::Mutex,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
@@ -28,10 +28,35 @@ const TARGET_TRIPLE: &str = "x86_64-unknown-linux-musl";
 #[cfg(all(target_os = "linux", target_arch = "aarch64", target_env = "musl"))]
 const TARGET_TRIPLE: &str = "aarch64-unknown-linux-musl";
 
+struct OwnedBackend {
+    child: Option<Child>,
+}
+
+impl OwnedBackend {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            shutdown_child(child, Duration::from_secs(5));
+        }
+        self.child = None;
+    }
+}
+
+impl Drop for OwnedBackend {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 #[derive(Default)]
 struct BackendInner {
-    child: Option<Child>,
-    stopping: bool,
+    backend: Option<OwnedBackend>,
 }
 
 #[derive(Default)]
@@ -91,43 +116,32 @@ fn request_graceful_shutdown(pid: u32) -> Result<(), String> {
     }
 }
 
-fn stop_backend(app: &tauri::AppHandle) {
-    let state = app.state::<BackendState>();
-    let pid = {
-        let mut inner = state.0.lock().expect("backend state lock poisoned");
-        let Some(pid) = inner.child.as_ref().map(Child::id) else {
-            return;
-        };
-        inner.stopping = true;
-        pid
-    };
-
-    let _ = request_graceful_shutdown(pid);
-    for _ in 0..50 {
-        std::thread::sleep(Duration::from_millis(100));
-        let mut inner = state.0.lock().expect("backend state lock poisoned");
-        let Some(child) = inner.child.as_mut() else {
-            return;
-        };
+fn shutdown_child(child: &mut Child, timeout: Duration) {
+    let _ = request_graceful_shutdown(child.id());
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
         match child.try_wait() {
-            Ok(Some(_)) => {
-                inner.child = None;
-                return;
-            }
+            Ok(Some(_)) => return,
             Ok(None) => {}
             Err(_) => break,
         }
+        std::thread::sleep(Duration::from_millis(100));
     }
 
-    if let Some(mut child) = state
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn stop_backend(app: &tauri::AppHandle) {
+    let mut backend = app
+        .state::<BackendState>()
         .0
         .lock()
         .expect("backend state lock poisoned")
-        .child
-        .take()
-    {
-        let _ = child.kill();
-        let _ = child.wait();
+        .backend
+        .take();
+    if let Some(backend) = backend.as_mut() {
+        backend.shutdown();
     }
 }
 
@@ -138,18 +152,23 @@ fn monitor_backend(app: tauri::AppHandle) {
             let state = app.state::<BackendState>();
             let exited_unexpectedly = {
                 let mut inner = state.0.lock().expect("backend state lock poisoned");
-                let Some(child) = inner.child.as_mut() else {
+                let Some(backend) = inner.backend.as_mut() else {
+                    break;
+                };
+                let Some(child) = backend.child.as_mut() else {
+                    inner.backend = None;
                     break;
                 };
                 match child.try_wait() {
                     Ok(Some(_)) => {
-                        let unexpected = !inner.stopping;
-                        inner.child = None;
-                        unexpected
+                        backend.child = None;
+                        inner.backend = None;
+                        true
                     }
                     Ok(None) => false,
                     Err(_) => {
-                        inner.child = None;
+                        backend.child = None;
+                        inner.backend = None;
                         true
                     }
                 }
@@ -211,8 +230,7 @@ async fn start_backend(app: &tauri::AppHandle) -> Result<String, String> {
     {
         let state = app.state::<BackendState>();
         let mut inner = state.0.lock().map_err(|error| error.to_string())?;
-        inner.child = Some(child);
-        inner.stopping = false;
+        inner.backend = Some(OwnedBackend::new(child));
     }
     monitor_backend(app.clone());
 
@@ -336,4 +354,61 @@ pub fn run() {
             stop_backend(app);
         }
     });
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_only_stops_the_owned_child() {
+        let mut owned = OwnedBackend::new(
+            Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("owned test child should start"),
+        );
+        let mut independent = OwnedBackend::new(
+            Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("independent test child should start"),
+        );
+
+        owned.shutdown();
+
+        assert!(owned.child.is_none());
+        assert!(
+            independent
+                .child
+                .as_mut()
+                .expect("independent child should still be tracked")
+                .try_wait()
+                .expect("independent child status should be readable")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn dropping_owned_backend_reaps_its_child() {
+        let backend = OwnedBackend::new(
+            Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("test child should start"),
+        );
+        let pid = backend
+            .child
+            .as_ref()
+            .expect("child should be tracked")
+            .id();
+
+        drop(backend);
+
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
 }

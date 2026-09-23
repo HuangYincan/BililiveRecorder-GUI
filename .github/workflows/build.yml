@@ -23,6 +23,8 @@ jobs:
       contents: read
     env:
       TAURI_TARGET_TRIPLE: ${{ matrix.target }}
+      APPIMAGE_EXTRACT_AND_RUN: "1"
+      NO_STRIP: "1"
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5

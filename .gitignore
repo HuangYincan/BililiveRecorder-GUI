@@ -12,4 +12,7 @@ src-tauri/sidecar/*
 .dmg-mount-*/
 .install-smoke-*/
 .installed-*-workdir/
+.independent-*/
+.lifecycle-*-workdir/
 bililive-recorder-webui-main.png
+bililive-recorder-webui-lifecycle.png
