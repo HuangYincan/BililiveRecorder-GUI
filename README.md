@@ -29,7 +29,7 @@
 1. `.github/workflows/sync-upstream.yml` 每天查询 BililiveRecorder 最新官方 Release。
 2. 发现新版本后，自动更新 `upstream.json`、npm/Tauri/Cargo 版本，校验各平台官方 CLI 资产，并创建启用自动合并的同步 PR。
 3. 自动合并到 `main` 后，`.github/workflows/release.yml` 在 macOS ARM64、macOS x64、Windows x64、Linux x64 上重新下载对应官方 CLI 并构建桌面安装包。
-4. 发布流程使用 Tauri updater 私钥签名更新包，并生成 GitHub Release 的 `latest.json`。
+4. 发布流程使用 Tauri updater 私钥签名更新包；各平台构建完成后统一聚合并校验 GitHub Release 的 `latest.json`，避免矩阵任务互相覆盖更新清单。
 5. 已安装应用启动后通过系统原生对话框提示更新；验证签名后原位更新并重启，不引入自建更新页面。
 
 因此 WebUI 的版本同步依赖上游官方 CLI 产物本身，不需要本仓库复制或追踪 WebUI 源文件。已安装用户通过签名桌面更新获得新的 CLI 与其内嵌 WebUI。

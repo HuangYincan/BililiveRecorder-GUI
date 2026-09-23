@@ -88,9 +88,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION=$(node -p "require('./package.json').version")
-          mkdir release-audit
-          gh release download "app-v${VERSION}" --pattern latest.json --dir release-audit
+          mkdir -p release-audit/signatures
           gh release view "app-v${VERSION}" --json assets > release-audit/assets.json
+          gh release download "app-v${VERSION}" --pattern '*.sig' --dir release-audit/signatures
+          npm run release:manifest -- release-audit/assets.json release-audit/signatures release-audit/latest.json
+          gh release upload "app-v${VERSION}" release-audit/latest.json --clobber
           npm run release:validate -- release-audit/latest.json release-audit/assets.json
       - name: Publish draft release
         env:
