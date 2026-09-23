@@ -187,9 +187,23 @@ jobs:
             }
           }
       - name: Upload artifact lifecycle evidence
+        id: upload_lifecycle_evidence
         if: always() && env.BILILIVE_ARTIFACT_EVIDENCE_DIR != ''
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: artifact-lifecycle-${{ matrix.target }}
           path: ${{ env.BILILIVE_ARTIFACT_EVIDENCE_DIR }}
-          if-no-files-found: warn
+          if-no-files-found: error
+      # GitHub's artifact API occasionally times out on CreateArtifact even
+      # after both real-app tests pass. Retry once, including ambiguous partial
+      # creates; a second failure still fails the job rather than hiding loss
+      # of the only per-run process/log evidence.
+      - name: Retry artifact lifecycle evidence upload
+        if: always() && steps.upload_lifecycle_evidence.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifact-lifecycle-${{ matrix.target }}
+          path: ${{ env.BILILIVE_ARTIFACT_EVIDENCE_DIR }}
+          if-no-files-found: error
+          overwrite: true
