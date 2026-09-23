@@ -20,7 +20,7 @@ use std::{
 
 use bililive_recorder_gui_lib::{
     BackendCommand, EVENT_ERROR_PREFIX, EVENT_EXITED, EVENT_STARTED_PREFIX, EVENT_STOPPED,
-    GuardianConfig, shutdown_guardian, supervise, supervise_with,
+    GuardianConfig, UNRECLAIMED_BACKEND_MESSAGE, shutdown_guardian, supervise, supervise_with,
 };
 use std::{io::Read, os::unix::net::UnixStream};
 
@@ -655,5 +655,28 @@ fn a_hung_guardian_is_left_alone_where_ending_it_would_orphan_the_backend() {
         "the stand-in child to reach its own end",
         Duration::from_secs(SELF_LIMITING + 5),
         || !alive(child_pid),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// What the user is told when the backend cannot be reclaimed
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_unreclaimed_backend_message_cannot_name_a_process_id() {
+    // The maintainers accepted the macOS hung-guardian limitation on the
+    // condition that nobody is pointed at a process to kill. That is enforced
+    // by shape, not by care: the message takes no arguments, so there is no pid
+    // it could interpolate. This test pins the remaining way it could regress —
+    // someone rewriting it to mention one.
+    let message = UNRECLAIMED_BACKEND_MESSAGE;
+
+    assert!(
+        !message.chars().any(|c| c.is_ascii_digit()),
+        "the message must not contain a number that could be read as a pid: {message:?}"
+    );
+    assert!(
+        message.contains("可能仍在运行"),
+        "the message must still warn that the backend may be running: {message:?}"
     );
 }

@@ -90,8 +90,8 @@
 //! macOS has no `PR_SET_PDEATHSIG` and no job object, so nothing ties the
 //! backend's lifetime to the guardian's. If the guardian is killed outright the
 //! backend is reparented to `launchd` and the app can neither prove it is that
-//! backend nor safely signal it; the app reports the backend's pid so a human
-//! can act.
+//! backend nor safely signal it, so it says the backend may still be running
+//! and leaves it at that.
 //!
 //! A *hung* guardian is the harder case, and this is the trade-off being made
 //! rather than a gap left by accident. The app can see that the guardian has
@@ -106,13 +106,30 @@
 //!   afterwards shuts the backend down on its own.
 //!
 //! So on macOS a hung guardian means the backend may keep running until the
-//! guardian resumes or a human stops it, and the app says so instead of
-//! pretending otherwise. It does **not** reach for the backend's pid to force
-//! the issue: a forced recovery that can hit an unrelated process is not worth
-//! a prompt shutdown. Closing this properly needs a kernel-side reaper that
-//! adopts orphans (a launchd agent or a system extension) — out of proportion
-//! to this bug, and a signing and notarisation burden — so it is left as a
-//! decision for the maintainers rather than assumed.
+//! guardian resumes, and the app says so instead of pretending otherwise. It
+//! does **not** reach for the backend's pid to force the issue: a forced
+//! recovery that can hit an unrelated process is not worth a prompt shutdown.
+//! Closing this properly needs a kernel-side reaper that adopts orphans (a
+//! launchd agent or a system extension) — out of proportion to this bug, and a
+//! signing and notarisation burden — so it is left as a decision for the
+//! maintainers rather than assumed.
+//!
+//! ## What the user is told, and what they are not
+//!
+//! The maintainers accepted this limitation on the terms that it is described
+//! accurately and that nobody is pointed at a process to kill. Both are
+//! structural here rather than a matter of wording discipline:
+//!
+//! * [`UNRECLAIMED_BACKEND_MESSAGE`] takes **no arguments**, so it cannot name
+//!   a process id even by accident. The pid the guardian reported goes to
+//!   stderr, where it is evidence for a log rather than an instruction.
+//! * The message says the backend *may* still be running and that the app
+//!   cannot confirm otherwise. It never claims the abnormal paths all clean up
+//!   after themselves — on macOS this one demonstrably does not.
+//! * It tells the user **not** to terminate by process id, because a pid read
+//!   from a pipe at startup may by now name an unrelated process. That is the
+//!   same mistake this design exists to prevent; it would be perverse to
+//!   automate the avoidance and then recommend it in a dialog.
 //!
 //! ## Windows containment is established before the backend exists
 //!
@@ -617,6 +634,22 @@ fn spawn_guardian(config: &GuardianConfig) -> Result<Child, String> {
     command.spawn().map_err(|error| error.to_string())
 }
 
+/// Shown when the backend may still be running and could not be reclaimed.
+///
+/// Deliberately takes no arguments, so it **cannot** name a process id. The pid
+/// the guardian reported is a snapshot from startup; by the time this is shown
+/// it may have been recycled onto an unrelated process, and telling a user to
+/// stop "process 12345" would be inviting the very mistake this design exists
+/// to prevent. The pid goes to stderr for diagnosis instead, where it is
+/// evidence rather than an instruction.
+///
+/// The wording is also careful not to promise that every abnormal path cleans
+/// itself up: it says the backend may still be running, because on this
+/// platform nothing here can prove otherwise.
+pub const UNRECLAIMED_BACKEND_MESSAGE: &str = "录播后端可能仍在运行：本应用无法安全确认它已停止，也不会向无法确认归属的进程发送信号。\
+     请勿按进程号手动终止任何进程，那样可能误伤其他程序。可以退出并重新启动本应用，\
+     或在应用日志中查看详情。";
+
 fn report_fatal(app: &tauri::AppHandle, message: &str) {
     app.dialog()
         .message(message)
@@ -676,20 +709,21 @@ fn watch_guardian(app: tauri::AppHandle, events: ChildStdout) {
         }
 
         if !app.state::<BackendState>().stopping.load(Ordering::SeqCst) {
-            // The guardian is gone without having shut the backend down. On
-            // macOS the kernel cannot take the backend with it, so say which
-            // process and port to look at instead of leaving the user to find
-            // it. Naming a pid is safe: nothing here signals it.
+            // The guardian is gone without having shut the backend down, and on
+            // macOS the kernel cannot take the backend with it. The pid the
+            // guardian reported goes to the log for diagnosis; it is
+            // deliberately kept out of what the user is told, because a pid
+            // read from a pipe is a snapshot — by now it may name a different
+            // process, and pointing someone at it invites exactly the mistake
+            // this whole design exists to prevent.
             let pid = app
                 .state::<BackendState>()
                 .backend_pid
                 .load(Ordering::SeqCst);
-            let detail = if pid == 0 {
-                "录播后端守护进程异常退出，录播后端可能仍在运行。".to_owned()
-            } else {
-                format!("录播后端守护进程异常退出，录播后端（进程号 {pid}）可能仍在运行。")
-            };
-            report_fatal(&app, &detail);
+            if pid != 0 {
+                eprintln!("bililive-recorder-gui: backend pid reported by the guardian was {pid}");
+            }
+            report_fatal(&app, UNRECLAIMED_BACKEND_MESSAGE);
             app.exit(1);
         }
     });
@@ -734,15 +768,10 @@ fn stop_backend(app: &tauri::AppHandle) {
             .state::<BackendState>()
             .backend_pid
             .load(Ordering::SeqCst);
-        let detail = if pid == 0 {
-            "录播后端守护进程无响应，且本平台无法安全回收它启动的录播后端；该后端可能仍在运行，需要手工停止。"
-                .to_owned()
-        } else {
-            format!(
-                "录播后端守护进程无响应，且本平台无法安全回收它启动的录播后端（进程号 {pid}）；该后端可能仍在运行，需要手工停止。"
-            )
-        };
-        report_warning(app, &detail);
+        if pid != 0 {
+            eprintln!("bililive-recorder-gui: backend pid reported by the guardian was {pid}");
+        }
+        report_warning(app, UNRECLAIMED_BACKEND_MESSAGE);
     }
 }
 
