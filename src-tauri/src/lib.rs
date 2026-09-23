@@ -1,35 +1,49 @@
 //! BililiveRecorder GUI — a Tauri desktop shell around the official
 //! BililiveRecorder CLI, whose embedded WebUI is the only user interface.
 //!
-//! # Sidecar lifecycle guarantees
+//! # Backend ownership
 //!
-//! The app supervises exactly one backend process: the official
-//! `BililiveRecorder.Cli` shipped inside the bundle. It is always addressed by
-//! the PID returned from `Command::spawn`. The app never enumerates processes
-//! and never signals anything by name or by process group, so a recorder the
-//! user started independently is never touched.
+//! The desktop app **never handles the backend's process id**. It starts one
+//! guardian process and hands it the command line to run; the guardian creates
+//! the backend as *its own* child and is the only thing that ever signals or
+//! reaps it. Every signal therefore goes through a `std::process::Child` the
+//! guardian itself spawned:
+//!
+//! * The kernel does not recycle a pid while an unreaped child still holds it,
+//!   so a recycled-pid mix-up cannot happen — there is no pid to mismatch, and
+//!   no window between "check who this pid is" and "signal it".
+//! * No code path inspects `/proc`, `proc_pidpath`, process names or process
+//!   groups. An instance the user started themselves is unreachable by
+//!   construction, at any path, including a second copy of the same binary.
+//!
+//! # Exit path guarantees
 //!
 //! | Exit path | Guarantee |
 //! | --- | --- |
-//! | Main window closed (`CloseRequested`) | backend shut down before the app exits |
-//! | App quit — Cmd+Q, Dock ▸ Quit, `osascript quit` | backend shut down; on macOS a normal quit only ever delivers `RunEvent::Exit`, never `CloseRequested` |
-//! | `SIGTERM` / `SIGHUP` / `SIGINT` to the app | handled explicitly; backend shut down, app exits with `128 + signal` |
-//! | App `SIGKILL`ed, crashed, panicked or aborted | a guardian process spawned next to the backend sees the app disappear through a closed pipe and shuts the backend down |
+//! | Main window closed (`CloseRequested`) | the app asks the guardian to stop and waits for it, so the backend is down before the app exits |
+//! | App quit — Cmd+Q, Dock ▸ Quit, `osascript quit` | same; on macOS a normal quit only ever delivers `RunEvent::Exit`, never `CloseRequested` |
+//! | `SIGTERM` / `SIGHUP` / `SIGINT` to the app | handled explicitly, same shutdown, app exits with `128 + signal` |
+//! | App `SIGKILL`ed, crashed, panicked or aborted | the guardian notices the app disappear through a closed pipe and shuts the backend down on its own |
 //!
-//! Every path ends in the same two-stage shutdown: `SIGINT` first, which lets
-//! the CLI flush recordings and exit cleanly, escalating to `SIGKILL` only
-//! after [`GRACEFUL_SHUTDOWN_TIMEOUT`].
+//! Shutdown is two-stage everywhere: `SIGINT` first so the CLI can flush
+//! recordings and exit cleanly, escalating to `SIGKILL` only after
+//! [`GUARDIAN_GRACEFUL_TIMEOUT`].
+//!
+//! Known residual: if the *guardian* is killed outright while the app is still
+//! running, nothing is left holding the backend. The app notices (the guardian's
+//! event pipe reaches end of file) and reports it, but it cannot adopt the
+//! backend, so that backend would have to be stopped by hand.
 
 use std::{
     ffi::OsString,
     fs,
-    io::{self, Read},
+    io::{self, BufRead, BufReader, Read, Write},
     net::TcpListener,
-    path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    path::PathBuf,
+    process::{Child, ChildStdout, Command, Stdio},
     sync::{
-        Mutex,
-        atomic::{AtomicI32, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicI32, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -38,26 +52,26 @@ use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_updater::UpdaterExt;
 
-#[cfg(unix)]
-use std::os::unix::ffi::OsStringExt;
-
 const SIDECAR_NAME: &str = "BililiveRecorder.Cli";
 
-/// Hidden argv flag that re-runs this same executable as the sidecar guardian.
-const GUARDIAN_FLAG: &str = "--bililive-sidecar-guardian";
+/// Hidden argv flag that re-runs this same executable as the backend guardian.
+pub const GUARDIAN_FLAG: &str = "--bililive-sidecar-guardian";
 
 /// How long the backend may take to shut down gracefully before it is killed.
-const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
-const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// How long the guardian keeps re-reading a target's identity before deciding.
-/// Covers the instant between `fork` and `exec`, when the child still reports
-/// its parent's executable.
-const IDENTITY_SETTLE_TIMEOUT: Duration = Duration::from_millis(1000);
+pub const GUARDIAN_GRACEFUL_TIMEOUT: Duration = Duration::from_secs(8);
+/// Extra time the app gives the guardian to finish after that.
+const GUARDIAN_EXIT_MARGIN: Duration = Duration::from_secs(4);
+/// How often the guardian and the app re-check the state they are watching.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Timeout applied when the guardian is asked for its version by a human.
+const DEFAULT_GRACEFUL_TIMEOUT: Duration = GUARDIAN_GRACEFUL_TIMEOUT;
 
-/// Exit codes reported by the guardian process (not used by the GUI itself).
-const GUARDIAN_REAPED: i32 = 0;
-const GUARDIAN_TARGET_ALREADY_GONE: i32 = 0;
-const GUARDIAN_TARGET_UNVERIFIED: i32 = 2;
+/// One line the guardian writes to the app when it is done.
+pub const EVENT_STOPPED: &str = "stopped";
+/// The backend exited by itself, without anyone asking it to.
+pub const EVENT_EXITED: &str = "exited";
+/// The guardian could not do its job; the rest of the line says why.
+pub const EVENT_ERROR_PREFIX: &str = "error: ";
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const TARGET_TRIPLE: &str = "aarch64-apple-darwin";
@@ -74,26 +88,248 @@ const TARGET_TRIPLE: &str = "x86_64-unknown-linux-musl";
 #[cfg(all(target_os = "linux", target_arch = "aarch64", target_env = "musl"))]
 const TARGET_TRIPLE: &str = "aarch64-unknown-linux-musl";
 
-#[derive(Default)]
-struct BackendInner {
-    child: Option<Child>,
-    /// Kept alive so its stdin pipe stays open: the pipe closing is how the
-    /// guardian learns that this process is gone. Dropping it early would make
-    /// the guardian reap the backend while the app is still running.
-    guardian: Option<Child>,
-    stopping: bool,
+// ---------------------------------------------------------------------------
+// What the guardian is asked to run
+// ---------------------------------------------------------------------------
+
+/// The backend command line the guardian will own.
+///
+/// Deliberately contains no process id: the guardian learns the backend's pid
+/// only from the `Child` it creates itself, which is what makes every signal it
+/// sends exact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackendCommand {
+    pub program: PathBuf,
+    pub args: Vec<OsString>,
+    pub envs: Vec<(OsString, OsString)>,
 }
 
-#[derive(Default)]
-struct BackendState(Mutex<BackendInner>);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuardianConfig {
+    pub backend: BackendCommand,
+    pub graceful_timeout: Duration,
+}
 
-impl BackendState {
-    fn lock(&self) -> std::sync::MutexGuard<'_, BackendInner> {
-        // A panic in another thread must not turn a shutdown into a crash.
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+impl GuardianConfig {
+    /// Parses `<exe> GUARDIAN_FLAG --program P [--backend-arg A]…
+    /// [--backend-env K V]… [--graceful-timeout-ms N]`, or `None` when this is
+    /// an ordinary launch of the app.
+    pub fn from_args<I, S>(args: I) -> Option<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        let mut args = args.into_iter().map(Into::into);
+        let _executable = args.next()?;
+        if args.next()? != OsString::from(GUARDIAN_FLAG) {
+            return None;
+        }
+
+        let mut program: Option<PathBuf> = None;
+        let mut backend_args = Vec::new();
+        let mut envs = Vec::new();
+        let mut graceful_timeout = DEFAULT_GRACEFUL_TIMEOUT;
+
+        while let Some(flag) = args.next() {
+            match flag.to_str()? {
+                "--program" => program = Some(PathBuf::from(args.next()?)),
+                "--backend-arg" => backend_args.push(args.next()?),
+                "--backend-env" => {
+                    let key = args.next()?;
+                    let value = args.next()?;
+                    envs.push((key, value));
+                }
+                "--graceful-timeout-ms" => {
+                    let millis: u64 = args.next()?.to_str()?.parse().ok()?;
+                    graceful_timeout = Duration::from_millis(millis);
+                }
+                _ => return None,
+            }
+        }
+
+        Some(Self {
+            backend: BackendCommand {
+                program: program?,
+                args: backend_args,
+                envs,
+            },
+            graceful_timeout,
+        })
     }
+
+    /// The argv the app passes to its own binary to start this guardian.
+    pub fn to_args(&self) -> Vec<OsString> {
+        let mut args = vec![
+            OsString::from(GUARDIAN_FLAG),
+            OsString::from("--program"),
+            self.backend.program.clone().into_os_string(),
+        ];
+        for arg in &self.backend.args {
+            args.push(OsString::from("--backend-arg"));
+            args.push(arg.clone());
+        }
+        for (key, value) in &self.backend.envs {
+            args.push(OsString::from("--backend-env"));
+            args.push(key.clone());
+            args.push(value.clone());
+        }
+        args.push(OsString::from("--graceful-timeout-ms"));
+        args.push(OsString::from(
+            self.graceful_timeout.as_millis().to_string(),
+        ));
+        args
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Guardian
+// ---------------------------------------------------------------------------
+
+/// Asks a backend to exit cleanly.
+///
+/// `pid` always comes from a `Child` this process created and has not reaped,
+/// so the kernel still reserves it for that child and cannot have handed it to
+/// anything else.
+fn send_interrupt(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::kill(pid as libc::c_int, libc::SIGINT) == 0 }
+    }
+
+    #[cfg(not(unix))]
+    {
+        // A console-less Windows child cannot be sent Ctrl+C at all.
+        let _ = pid;
+        false
+    }
+}
+
+/// Walks the guardian's own child through the two-stage shutdown.
+fn shutdown_child(child: &mut Child, graceful_timeout: Duration) {
+    if send_interrupt(child.id()) {
+        let deadline = Instant::now() + graceful_timeout;
+        loop {
+            match child.try_wait() {
+                // Reaped: from here on the pid is free, and nothing below may
+                // signal it again.
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn write_event<W: Write>(events: &mut W, line: &str) {
+    let _ = writeln!(events, "{line}");
+    let _ = events.flush();
+}
+
+/// Owns `config.backend` for as long as this process lives.
+///
+/// Returns after the backend has been reaped, having written exactly one line
+/// to `events`: [`EVENT_STOPPED`], [`EVENT_EXITED`] or an [`EVENT_ERROR_PREFIX`]
+/// message. `keepalive` reaching end of file means the app is gone.
+pub fn supervise<R, W>(config: &GuardianConfig, mut keepalive: R, mut events: W) -> i32
+where
+    R: Read + Send + 'static,
+    W: Write,
+{
+    let mut command = Command::new(&config.backend.program);
+    command
+        .args(&config.backend.args)
+        .envs(config.backend.envs.iter().cloned())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(directory) = config.backend.program.parent() {
+        command.current_dir(directory);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            write_event(
+                &mut events,
+                &format!("{EVENT_ERROR_PREFIX}无法启动录播后端：{error}"),
+            );
+            return 1;
+        }
+    };
+
+    // End of file on the keepalive pipe is the only signal that also arrives
+    // when the app was killed outright, so it is watched from its own thread.
+    let app_gone = Arc::new(AtomicBool::new(false));
+    {
+        let app_gone = Arc::clone(&app_gone);
+        std::thread::spawn(move || {
+            let mut scratch = [0u8; 64];
+            loop {
+                match keepalive.read(&mut scratch) {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            app_gone.store(true, Ordering::SeqCst);
+        });
+    }
+
+    loop {
+        if app_gone.load(Ordering::SeqCst) {
+            shutdown_child(&mut child, config.graceful_timeout);
+            write_event(&mut events, EVENT_STOPPED);
+            return 0;
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                write_event(&mut events, EVENT_EXITED);
+                return 0;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                write_event(
+                    &mut events,
+                    &format!("{EVENT_ERROR_PREFIX}无法监视录播后端：{error}"),
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                return 1;
+            }
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Parses the guardian configuration out of this process's real arguments.
+pub fn guardian_config() -> Option<GuardianConfig> {
+    GuardianConfig::from_args(std::env::args_os())
+}
+
+/// Entry point used when the binary is re-run with [`GUARDIAN_FLAG`].
+pub fn run_guardian(config: &GuardianConfig) -> i32 {
+    supervise(config, io::stdin(), io::stdout())
+}
+
+// ---------------------------------------------------------------------------
+// App side
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct BackendState {
+    /// The guardian process. Holding it keeps the keepalive pipe open; closing
+    /// that pipe is the only way the app asks for a shutdown.
+    guardian: Mutex<Option<Child>>,
+    stopping: AtomicBool,
 }
 
 fn reserve_local_port() -> Result<u16, String> {
@@ -132,313 +368,94 @@ fn work_directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| error.to_string())
 }
 
-// ---------------------------------------------------------------------------
-// Process identity — used to confirm that a PID is still the process we
-// spawned before anything is signalled. The app's primary safety property is
-// that it only ever addresses the PID returned by `Command::spawn`; this check
-// is the second line of defence against that PID having been recycled since.
-// ---------------------------------------------------------------------------
-
-/// Resolves the executable behind `pid`, or `None` when it cannot be read.
-#[cfg(unix)]
-fn process_executable(pid: u32) -> Option<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        let link = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
-        let text = link.to_string_lossy().into_owned();
-        // The kernel marks the link when the backing file was replaced.
-        let text = text.strip_suffix(" (deleted)").unwrap_or(&text).to_string();
-        Some(PathBuf::from(text))
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-        let length = unsafe {
-            libc::proc_pidpath(
-                pid as libc::c_int,
-                buffer.as_mut_ptr().cast(),
-                buffer.len() as u32,
-            )
-        };
-        if length <= 0 {
-            return None;
-        }
-        buffer.truncate(length as usize);
-        if buffer.last() == Some(&0) {
-            buffer.pop();
-        }
-        Some(PathBuf::from(OsString::from_vec(buffer)))
-    }
-}
-
-/// True when the resolved executables refer to the same file.
-#[cfg(unix)]
-fn same_executable(left: &Path, right: &Path) -> bool {
-    match (fs::canonicalize(left), fs::canonicalize(right)) {
-        (Ok(left), Ok(right)) => left == right,
-        // The backend may already be gone (uninstalled app): fall back to a
-        // literal comparison, which then reports a mismatch and stops us from
-        // signalling a PID we can no longer identify.
-        _ => left == right,
-    }
-}
-
-/// True while `pid` exists and can be signalled.
-#[cfg(unix)]
-fn process_alive(pid: u32) -> bool {
-    if unsafe { libc::kill(pid as libc::c_int, 0) } == 0 {
-        return true;
-    }
-    // EPERM means the process exists but belongs to another user.
-    io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-/// Asks the backend to shut down cleanly. Returns whether the request was sent.
-fn request_graceful_shutdown(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        unsafe { libc::kill(pid as libc::c_int, libc::SIGINT) == 0 }
-    }
-
-    #[cfg(windows)]
-    {
-        // A console-less child cannot be sent Ctrl+C; the caller escalates
-        // straight to a forced termination instead.
-        let _ = pid;
-        false
-    }
-}
-
-/// Terminates the backend without giving it a chance to clean up.
-#[cfg(unix)]
-fn force_terminate(pid: u32) {
-    unsafe { libc::kill(pid as libc::c_int, libc::SIGKILL) };
-}
-
-/// Walks `pid` through the two-stage shutdown and returns once it is gone.
-#[cfg(unix)]
-fn shutdown_process(pid: u32, timeout: Duration) {
-    if !process_alive(pid) {
-        return;
-    }
-
-    if request_graceful_shutdown(pid) {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if !process_alive(pid) {
-                return;
-            }
-            std::thread::sleep(SHUTDOWN_POLL_INTERVAL);
-        }
-    }
-
-    force_terminate(pid);
-}
-
-// ---------------------------------------------------------------------------
-// Guardian: survives this process and reaps the backend if we vanish without
-// running any shutdown code at all (SIGKILL, crash, panic, abort).
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReapTarget {
-    pub pid: u32,
-    pub executable: PathBuf,
-}
-
-impl ReapTarget {
-    /// Parses `["<exe>", GUARDIAN_FLAG, "<pid>", "<sidecar path>"]`.
-    pub fn from_args<I, S>(args: I) -> Option<Self>
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<OsString>,
-    {
-        let mut args = args.into_iter().map(Into::into);
-        let _executable = args.next()?;
-        if args.next()? != OsString::from(GUARDIAN_FLAG) {
-            return None;
-        }
-        let pid = args.next()?.to_string_lossy().parse().ok()?;
-        let executable = PathBuf::from(args.next()?);
-        Some(Self { pid, executable })
-    }
-}
-
-/// Parses the guardian target from the real process arguments.
-pub fn guardian_target() -> Option<ReapTarget> {
-    ReapTarget::from_args(std::env::args_os())
-}
-
-/// Reaps the target once `input` reaches end of file.
-///
-/// The GUI holds the write end of that pipe for its whole lifetime, so end of
-/// file means the GUI is gone — the only signal that also fires when it was
-/// killed outright.
-#[cfg(unix)]
-pub fn guard<R: Read>(input: &mut R, target: &ReapTarget) -> i32 {
-    guard_with_timeout(input, target, GRACEFUL_SHUTDOWN_TIMEOUT)
-}
-
-/// [`guard`] with an explicit graceful-shutdown budget.
-#[cfg(unix)]
-pub fn guard_with_timeout<R: Read>(input: &mut R, target: &ReapTarget, timeout: Duration) -> i32 {
-    let mut scratch = [0u8; 64];
-    loop {
-        match input.read(&mut scratch) {
-            Ok(0) => break,
-            Ok(_) => continue,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            // A read error is not proof that the app is gone, but the pipe is
-            // the only supervision channel we have; treat it as a disconnect.
-            Err(_) => break,
-        }
-    }
-
-    if !process_alive(target.pid) {
-        return GUARDIAN_TARGET_ALREADY_GONE;
-    }
-
-    // A positive mismatch is proof that the PID now belongs to a different
-    // program, so nothing is signalled. An identity that cannot be read at all
-    // is not proof of anything: refusing there would resurrect the orphaned
-    // backend this guardian exists to prevent, and the target PID was alive and
-    // ours only moments ago.
-    let deadline = Instant::now() + IDENTITY_SETTLE_TIMEOUT;
-    loop {
-        match process_executable(target.pid) {
-            Some(actual) if same_executable(&actual, &target.executable) => break,
-            Some(_) => {
-                if Instant::now() >= deadline {
-                    return GUARDIAN_TARGET_UNVERIFIED;
-                }
-            }
-            None => break,
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-
-    shutdown_process(target.pid, timeout);
-    GUARDIAN_REAPED
-}
-
-/// Entry point used when the binary is re-run with [`GUARDIAN_FLAG`].
-///
-/// Only Unix builds ship a guardian: a *correct* Windows equivalent has to be a
-/// Job Object with `KILL_ON_JOB_CLOSE`, which needs Win32 bindings this project
-/// does not carry yet. On Windows the guardian is simply absent and the in-app
-/// exit paths do the work.
-#[cfg(unix)]
-pub fn run_guardian(target: &ReapTarget) -> i32 {
-    guard(&mut io::stdin(), target)
-}
-
-#[cfg(unix)]
-fn spawn_guardian(sidecar_pid: u32, sidecar: &Path) -> Result<Child, String> {
+fn spawn_guardian(config: &GuardianConfig) -> Result<Child, String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let mut command = Command::new(executable);
     command
-        .arg(GUARDIAN_FLAG)
-        .arg(sidecar_pid.to_string())
-        .arg(sidecar)
-        // Piped and never written to: the GUI holds the write end so that the
-        // pipe closes exactly when this process dies.
+        .args(config.to_args())
+        // Piped and never written to: the app holds the write end so that the
+        // pipe closes exactly when this process dies. The guardian reports back
+        // on its stdout.
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
     command.spawn().map_err(|error| error.to_string())
 }
 
-#[cfg(not(unix))]
-fn spawn_guardian(_sidecar_pid: u32, _sidecar: &Path) -> Result<Child, String> {
-    Err("当前平台未提供 sidecar 守护进程。".into())
+fn report_fatal(app: &tauri::AppHandle, message: &str) {
+    app.dialog()
+        .message(message)
+        .title("BililiveRecorder")
+        .kind(MessageDialogKind::Error)
+        .blocking_show();
 }
 
-// ---------------------------------------------------------------------------
-// Backend supervision
-// ---------------------------------------------------------------------------
-
-fn stop_backend(app: &tauri::AppHandle) {
-    let state = app.state::<BackendState>();
-
-    let child = {
-        let mut inner = state.lock();
-        // Marked before the child is taken so `monitor_backend` never reports
-        // this as an unexpected exit.
-        inner.stopping = true;
-        inner.child.take()
-    };
-
-    if let Some(mut child) = child {
-        let pid = child.id();
-        if request_graceful_shutdown(pid) {
-            let deadline = Instant::now() + GRACEFUL_SHUTDOWN_TIMEOUT;
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) => {
-                        if Instant::now() >= deadline {
-                            break;
-                        }
-                        std::thread::sleep(SHUTDOWN_POLL_INTERVAL);
-                    }
-                    Err(_) => break,
-                }
+/// Watches the guardian's event pipe.
+///
+/// The guardian writes exactly one line before exiting, so end of file without
+/// a line means the guardian itself died — the one case where nothing is left
+/// holding the backend.
+fn watch_guardian(app: tauri::AppHandle, events: ChildStdout) {
+    std::thread::spawn(move || {
+        for line in BufReader::new(events).lines().map_while(Result::ok) {
+            let line = line.trim().to_owned();
+            if line == EVENT_STOPPED {
+                return;
             }
+            if app.state::<BackendState>().stopping.load(Ordering::SeqCst) {
+                return;
+            }
+            if line == EVENT_EXITED {
+                report_fatal(&app, "录播后端意外退出，请查看应用日志。");
+            } else if let Some(detail) = line.strip_prefix(EVENT_ERROR_PREFIX) {
+                report_fatal(&app, detail);
+            } else {
+                report_fatal(&app, "录播后端守护进程返回了无法识别的状态。");
+            }
+            app.exit(1);
+            return;
         }
-        // Also reached when the backend ignored SIGINT, or when it could not be
-        // asked politely in the first place (Windows).
-        let _ = child.kill();
-        let _ = child.wait();
-    }
 
-    // The backend is confirmed down, so the guardian has nothing left to do.
-    // Closing its stdin lets it exit instead of lingering until this process
-    // disappears; it re-checks the backend before acting either way.
-    let guardian = state.lock().guardian.take();
-    if let Some(mut guardian) = guardian {
-        drop(guardian.stdin.take());
-        std::thread::spawn(move || {
-            let _ = guardian.wait();
-        });
-    }
-}
-
-fn monitor_backend(app: tauri::AppHandle) {
-    tauri::async_runtime::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            let state = app.state::<BackendState>();
-            let exited_unexpectedly = {
-                let mut inner = state.lock();
-                let Some(child) = inner.child.as_mut() else {
-                    break;
-                };
-                match child.try_wait() {
-                    Ok(Some(_)) => {
-                        let unexpected = !inner.stopping;
-                        inner.child = None;
-                        unexpected
-                    }
-                    Ok(None) => false,
-                    Err(_) => {
-                        inner.child = None;
-                        true
-                    }
-                }
-            };
-
-            if exited_unexpectedly {
-                app.dialog()
-                    .message("录播后端意外退出，请查看应用日志。")
-                    .title("BililiveRecorder")
-                    .kind(MessageDialogKind::Error)
-                    .blocking_show();
-                app.exit(1);
-                break;
-            }
+        if !app.state::<BackendState>().stopping.load(Ordering::SeqCst) {
+            report_fatal(&app, "录播后端守护进程异常退出，后端可能仍在运行。");
+            app.exit(1);
         }
     });
+}
+
+/// Asks the guardian to shut the backend down and waits for it to finish.
+///
+/// The guardian owns the backend, so this only closes the keepalive pipe. The
+/// guardian is deliberately *not* killed if it overruns: killing it would leave
+/// the backend with no owner at all. It finishes on its own instead.
+fn stop_backend(app: &tauri::AppHandle) {
+    let state = app.state::<BackendState>();
+    state.stopping.store(true, Ordering::SeqCst);
+    let guardian = state
+        .guardian
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+
+    let Some(mut guardian) = guardian else {
+        return;
+    };
+    drop(guardian.stdin.take());
+
+    let deadline = Instant::now() + GUARDIAN_GRACEFUL_TIMEOUT + GUARDIAN_EXIT_MARGIN;
+    loop {
+        match guardian.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
+            Ok(None) => return,
+            Err(_) => return,
+        }
+    }
 }
 
 async fn start_backend(app: &tauri::AppHandle) -> Result<String, String> {
@@ -458,56 +475,48 @@ async fn start_backend(app: &tauri::AppHandle) -> Result<String, String> {
     let port = reserve_local_port()?;
     let url = format!("http://127.0.0.1:{port}");
 
-    let mut command = Command::new(&executable);
-    command
-        .current_dir(executable.parent().ok_or("录播后端目录不可用。")?)
-        .arg("run")
-        .arg("--bind")
-        .arg(&url)
-        .arg(&workdir)
-        .env(
-            "BILILIVERECORDER_LOG_FILE_PATH",
-            log_directory.join("bililive-recorder.txt"),
-        )
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
-    }
-
-    let child = command
-        .spawn()
-        .map_err(|error| format!("无法启动录播后端：{error}"))?;
-    let sidecar_pid = child.id();
-
-    // Started before the guardian so that nothing else can inherit the pipe.
-    let guardian = match spawn_guardian(sidecar_pid, &executable) {
-        Ok(guardian) => Some(guardian),
-        Err(error) => {
-            // Losing the guardian only costs the crash/SIGKILL path; every
-            // other exit path still shuts the backend down.
-            eprintln!("无法启动 sidecar 守护进程：{error}");
-            None
-        }
+    let config = GuardianConfig {
+        backend: BackendCommand {
+            program: executable,
+            args: vec![
+                OsString::from("run"),
+                OsString::from("--bind"),
+                OsString::from(&url),
+                workdir.into_os_string(),
+            ],
+            envs: vec![(
+                OsString::from("BILILIVERECORDER_LOG_FILE_PATH"),
+                log_directory.join("bililive-recorder.txt").into_os_string(),
+            )],
+        },
+        graceful_timeout: GUARDIAN_GRACEFUL_TIMEOUT,
     };
+
+    let mut guardian = spawn_guardian(&config)?;
+    let events = guardian
+        .stdout
+        .take()
+        .ok_or("无法读取录播后端守护进程的状态。")?;
+    watch_guardian(app.clone(), events);
 
     {
         let state = app.state::<BackendState>();
-        let mut inner = state.lock();
-        inner.child = Some(child);
-        inner.stopping = false;
-        inner.guardian = guardian;
+        state.stopping.store(false, Ordering::SeqCst);
+        *state
+            .guardian
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(guardian);
     }
-    monitor_backend(app.clone());
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
         .map_err(|error| error.to_string())?;
     for _ in 0..120 {
+        if app.state::<BackendState>().stopping.load(Ordering::SeqCst) {
+            // The guardian already reported a failure and the app is exiting.
+            return Err("录播后端未能启动。".into());
+        }
         if client
             .get(format!("{url}/api/version"))
             .send()
@@ -550,17 +559,13 @@ async fn check_for_updates(app: tauri::AppHandle) {
 
     match update.download_and_install(|_, _| {}, || {}).await {
         Ok(()) => {
-            // Shut the backend down before handing over to the new build so two
-            // CLI instances never overlap.
+            // Hand the backend over before restarting so two CLI instances
+            // never overlap.
             stop_backend(&app);
             app.restart();
         }
         Err(error) => {
-            app.dialog()
-                .message(format!("更新安装失败：{error}"))
-                .title("BililiveRecorder")
-                .kind(MessageDialogKind::Error)
-                .blocking_show();
+            report_fatal(&app, &format!("更新安装失败：{error}"));
         }
     }
 }
@@ -620,7 +625,7 @@ fn install_signal_handlers() {}
 fn watch_for_signals(app: tauri::AppHandle) {
     std::thread::spawn(move || {
         loop {
-            std::thread::sleep(SHUTDOWN_POLL_INTERVAL);
+            std::thread::sleep(POLL_INTERVAL);
             let signal = PENDING_SIGNAL.load(Ordering::SeqCst);
             if signal != 0 {
                 stop_backend(&app);
@@ -646,12 +651,7 @@ pub fn run() {
             watch_for_signals(handle.clone());
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = launch_main_window(handle.clone()).await {
-                    handle
-                        .dialog()
-                        .message(error)
-                        .title("BililiveRecorder")
-                        .kind(MessageDialogKind::Error)
-                        .blocking_show();
+                    report_fatal(&handle, &error);
                     handle.exit(1);
                 }
             });
@@ -690,31 +690,83 @@ pub fn run() {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parses_guardian_arguments() {
-        let target = ReapTarget::from_args([
-            "/Applications/BililiveRecorder GUI.app/Contents/MacOS/bililive-recorder-gui",
-            GUARDIAN_FLAG,
-            "4242",
-            "/Applications/BililiveRecorder GUI.app/Contents/Resources/sidecar/BililiveRecorder.Cli",
-        ])
-        .expect("guardian arguments should parse");
-        assert_eq!(target.pid, 4242);
-        assert_eq!(
-            target.executable,
-            PathBuf::from(
-                "/Applications/BililiveRecorder GUI.app/Contents/Resources/sidecar/BililiveRecorder.Cli"
-            )
-        );
+    fn parse(args: &[&str]) -> Option<GuardianConfig> {
+        GuardianConfig::from_args(args.iter().copied())
     }
 
     #[test]
-    fn ignores_ordinary_invocations() {
-        assert!(ReapTarget::from_args(["bililive-recorder-gui"]).is_none());
-        assert!(ReapTarget::from_args(["app", "--some-other-flag", "1"]).is_none());
-        // Missing the executable argument.
-        assert!(ReapTarget::from_args(["app", GUARDIAN_FLAG, "12"]).is_none());
-        // Non-numeric PID.
-        assert!(ReapTarget::from_args(["app", GUARDIAN_FLAG, "abc", "/tmp/x"]).is_none());
+    fn parses_a_guardian_invocation() {
+        let config = parse(&[
+            "/Applications/BililiveRecorder GUI.app/Contents/MacOS/bililive-recorder-gui",
+            GUARDIAN_FLAG,
+            "--program",
+            "/Applications/BililiveRecorder GUI.app/Contents/Resources/sidecar/BililiveRecorder.Cli",
+            "--backend-arg",
+            "run",
+            "--backend-arg",
+            "--bind",
+            "--backend-arg",
+            "http://127.0.0.1:1234",
+            "--backend-env",
+            "BILILIVERECORDER_LOG_FILE_PATH",
+            "/tmp/log.txt",
+            "--graceful-timeout-ms",
+            "8000",
+        ])
+        .expect("a guardian invocation should parse");
+
+        assert_eq!(config.backend.args.len(), 3);
+        assert_eq!(config.backend.args[0], OsString::from("run"));
+        assert_eq!(
+            config.backend.envs,
+            vec![(
+                OsString::from("BILILIVERECORDER_LOG_FILE_PATH"),
+                OsString::from("/tmp/log.txt")
+            )]
+        );
+        assert_eq!(config.graceful_timeout, Duration::from_secs(8));
+    }
+
+    #[test]
+    fn ignores_ordinary_launches() {
+        assert!(parse(&["bililive-recorder-gui"]).is_none());
+        assert!(parse(&["app", "--some-other-flag"]).is_none());
+        // A guardian launch with no program is not usable.
+        assert!(parse(&["app", GUARDIAN_FLAG]).is_none());
+        assert!(parse(&["app", GUARDIAN_FLAG, "--program"]).is_none());
+        // Unknown flags are rejected rather than silently ignored.
+        assert!(parse(&["app", GUARDIAN_FLAG, "--program", "/bin/true", "--nope"]).is_none());
+    }
+
+    #[test]
+    fn arguments_round_trip() {
+        let config = GuardianConfig {
+            backend: BackendCommand {
+                program: PathBuf::from("/tmp/odd name/Cli"),
+                args: vec![OsString::from("run"), OsString::from("--bind")],
+                envs: vec![(OsString::from("K"), OsString::from("v with spaces"))],
+            },
+            graceful_timeout: Duration::from_millis(2500),
+        };
+        let argv: Vec<OsString> = std::iter::once(OsString::from("app"))
+            .chain(config.to_args())
+            .collect();
+
+        assert_eq!(GuardianConfig::from_args(argv), Some(config));
+    }
+
+    #[test]
+    fn the_guardian_is_never_told_a_process_id() {
+        // The only thing that identifies the backend is the command to run, so
+        // there is no pid for the guardian to be wrong about.
+        let config = parse(&["app", GUARDIAN_FLAG, "--program", "/bin/true"]).unwrap();
+        let rendered = config
+            .to_args()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!rendered.contains("--pid"));
+        assert!(!rendered.to_lowercase().contains("pid"));
     }
 }
