@@ -367,6 +367,7 @@ impl SupervisedChild for Child {
     }
 
     fn kill(&mut self) -> io::Result<()> {
+        artifact_probe::record("backend-hard-kill");
         Child::kill(self)
     }
 
@@ -479,7 +480,14 @@ fn shutdown_child(child: &mut impl SupervisedChild, graceful_timeout: Duration) 
     if child.interrupt() {
         match wait_for_child_exit(child, graceful_timeout) {
             // Reaped: the pid is free, and nothing below may signal it again.
-            WaitOutcome::Exited(_) => return,
+            WaitOutcome::Exited(code) => {
+                artifact_probe::record(if code == 0 {
+                    "backend-graceful-exit"
+                } else {
+                    "backend-exited-nonzero"
+                });
+                return;
+            }
             // The wait failed, so ownership of this pid is no longer
             // established. Escalating to `child.kill()` would signal it anyway
             // on the strength of having spawned it earlier — the same stale-pid

@@ -51,6 +51,19 @@ pub fn contains(trace: &str, pid: u32, event: &str) -> bool {
     trace.split_inclusive('\n').any(|line| line == marker)
 }
 
+/// The guardian shares this run's fresh trace and records its OWN PID. Its
+/// backend wait result is independent from the GUI's own exit markers.
+pub fn normal_backend_exit_observed(trace: &str) -> bool {
+    let has = |event: &str| {
+        trace.split_inclusive('\n').any(|line| {
+            line.split_once(' ').is_some_and(|(pid, rest)| {
+                pid.parse::<u32>().is_ok() && rest == format!("{event}\n")
+            })
+        })
+    };
+    has("backend-graceful-exit") && !has("backend-hard-kill")
+}
+
 pub fn close_progress(trace: &str, pid: u32) -> &'static str {
     for (event, state) in [
         ("run-exit", "EXIT_EVENT_OBSERVED"),
@@ -72,6 +85,16 @@ pub fn close_progress(trace: &str, pid: u32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normal_exit_requires_zero_code_backend_wait_without_a_kill_attempt() {
+        assert!(normal_backend_exit_observed("9 backend-graceful-exit\n"));
+        assert!(!normal_backend_exit_observed("7 run-exit\n"));
+        assert!(!normal_backend_exit_observed("9 backend-exited-nonzero\n"));
+        assert!(!normal_backend_exit_observed(
+            "9 backend-graceful-exit\n9 backend-hard-kill\n"
+        ));
+    }
 
     #[test]
     fn close_protocol_round_trip_and_rejection() {

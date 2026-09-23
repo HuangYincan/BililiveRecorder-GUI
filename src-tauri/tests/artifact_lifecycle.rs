@@ -390,6 +390,13 @@ fn quitting_the_app_stops_the_backend() {
         ),
         "normal close must let the guardian exit successfully, not terminate it with the control event"
     );
+    #[cfg(windows)]
+    assert!(
+        artifact_probe::normal_backend_exit_observed(
+            &fs::read_to_string(&app.trace).unwrap_or_default()
+        ),
+        "normal Windows close must reap a zero-exit backend without any hard-kill attempt"
+    );
     if flushed == Some(false) {
         panic!(
             "the backend stopped serving but the CLI log shows no clean \

@@ -111,3 +111,9 @@ The test's clean-shutdown assertion is NOT removed. Normal Windows close also
 requires `guardian-exit-success`, separating graceful child exit from an
 accidentally terminated guardian. This does not add recording-file evidence;
 that remains a separate gap even if all these control-flow checks pass.
+
+The Windows normal-close case additionally requires the guardian's actual
+`backend-graceful-exit` marker (bounded wait returned child exit code 0) and
+rejects ANY `backend-hard-kill` attempt in that run. GUI/guardian success and
+an early clean-shutdown log can no longer hide timeout escalation. This is
+stronger than the old log/port predicate and does not certify recording files.
