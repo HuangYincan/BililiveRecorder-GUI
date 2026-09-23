@@ -72,7 +72,9 @@ jobs:
 
           export BILILIVE_ARTIFACT_APP="$installed_app/Contents/MacOS/bililive-recorder-gui"
           export BILILIVE_ARTIFACT_OK=1
-          export BILILIVE_ARTIFACT_CLI_LOG="$HOME/Library/Logs/org.danmuji.bililiverecorder-gui/bililive-recorder.txt"
+          # Upstream Serilog uses RollingInterval.Day: it inserts YYYYMMDD
+          # before .txt; the unrolled configured base path never exists.
+          export BILILIVE_ARTIFACT_CLI_LOG="$HOME/Library/Logs/org.danmuji.bililiverecorder-gui/bililive-recorder$(date +%Y%m%d).txt"
           export BILILIVE_ARTIFACT_EVIDENCE_DIR="$RUNNER_TEMP/artifact-lifecycle-evidence"
           mkdir -p "$BILILIVE_ARTIFACT_EVIDENCE_DIR" "$(dirname "$BILILIVE_ARTIFACT_CLI_LOG")"
           printf 'BILILIVE_ARTIFACT_EVIDENCE_DIR=%s\n' "$BILILIVE_ARTIFACT_EVIDENCE_DIR" >> "$GITHUB_ENV"
@@ -100,7 +102,9 @@ jobs:
           export XDG_DATA_HOME="$RUNNER_TEMP/xdg-data"
           export BILILIVE_ARTIFACT_APP=/usr/bin/bililive-recorder-gui
           export BILILIVE_ARTIFACT_OK=1
-          export BILILIVE_ARTIFACT_CLI_LOG="$XDG_DATA_HOME/org.danmuji.bililiverecorder-gui/logs/bililive-recorder.txt"
+          # Upstream Serilog uses RollingInterval.Day: it inserts YYYYMMDD
+          # before .txt; the unrolled configured base path never exists.
+          export BILILIVE_ARTIFACT_CLI_LOG="$XDG_DATA_HOME/org.danmuji.bililiverecorder-gui/logs/bililive-recorder$(date +%Y%m%d).txt"
           export BILILIVE_ARTIFACT_EVIDENCE_DIR="$RUNNER_TEMP/artifact-lifecycle-evidence"
           mkdir -p "$BILILIVE_ARTIFACT_EVIDENCE_DIR" "$(dirname "$BILILIVE_ARTIFACT_CLI_LOG")"
           printf 'BILILIVE_ARTIFACT_EVIDENCE_DIR=%s\n' "$BILILIVE_ARTIFACT_EVIDENCE_DIR" >> "$GITHUB_ENV"
@@ -136,7 +140,8 @@ jobs:
 
             $env:BILILIVE_ARTIFACT_APP = $app.FullName
             $env:BILILIVE_ARTIFACT_OK = '1'
-            $env:BILILIVE_ARTIFACT_CLI_LOG = Join-Path $env:LOCALAPPDATA 'org.danmuji.bililiverecorder-gui/logs/bililive-recorder.txt'
+            # Upstream Serilog inserts YYYYMMDD before .txt (daily rolling).
+            $env:BILILIVE_ARTIFACT_CLI_LOG = Join-Path $env:LOCALAPPDATA ('org.danmuji.bililiverecorder-gui/logs/bililive-recorder{0}.txt' -f (Get-Date -Format yyyyMMdd))
             $env:BILILIVE_ARTIFACT_EVIDENCE_DIR = $evidenceDir
             New-Item -ItemType Directory -Force -Path $env:BILILIVE_ARTIFACT_EVIDENCE_DIR | Out-Null
             New-Item -ItemType Directory -Force -Path (Split-Path $env:BILILIVE_ARTIFACT_CLI_LOG) | Out-Null
