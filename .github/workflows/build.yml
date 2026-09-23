@@ -127,6 +127,7 @@ jobs:
           cp "$BILILIVE_ARTIFACT_CLI_LOG" "$BILILIVE_ARTIFACT_EVIDENCE_DIR/kill-cli.log"
       - name: Install MSI and verify artifact lifecycle
         if: matrix.platform == 'windows-latest'
+        timeout-minutes: 25
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -136,8 +137,17 @@ jobs:
           $installDir = Join-Path $env:RUNNER_TEMP 'BililiveRecorder-GUI-installed'
           $evidenceDir = Join-Path $env:RUNNER_TEMP 'artifact-lifecycle-evidence'
           New-Item -ItemType Directory -Force -Path $evidenceDir | Out-Null
-          & msiexec.exe /i $msi.FullName /qn /norestart "INSTALLDIR=$installDir" "/L*v" (Join-Path $evidenceDir 'msi-install.log')
-          if ($LASTEXITCODE -ne 0) { throw "MSI install failed: $LASTEXITCODE" }
+          "BILILIVE_ARTIFACT_EVIDENCE_DIR=$evidenceDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $installLog = Join-Path $evidenceDir 'msi-install.log'
+          # msiexec.exe is a GUI-subsystem launcher; invoking it with & can leave
+          # $LASTEXITCODE unset. Start-Process -Wait -PassThru supplies a real
+          # completion result instead of treating $null as an install failure.
+          $installArgs = @('/i', ('"{0}"' -f $msi.FullName), '/qn', '/norestart', ('INSTALLDIR="{0}"' -f $installDir), '/L*v', ('"{0}"' -f $installLog))
+          $installation = Start-Process -FilePath msiexec.exe -ArgumentList $installArgs -Wait -PassThru
+          if ($null -eq $installation -or $null -eq $installation.ExitCode -or $installation.ExitCode -ne 0) {
+            if (Test-Path $installLog) { Get-Content $installLog -Tail 60 }
+            throw "MSI installation did not succeed (exit=$($installation.ExitCode)); see uploaded msi-install.log"
+          }
 
           try {
             $app = Get-ChildItem $installDir -Recurse -File -Filter 'bililive-recorder-gui.exe' | Select-Object -First 1
@@ -150,7 +160,6 @@ jobs:
             $env:BILILIVE_ARTIFACT_EVIDENCE_DIR = $evidenceDir
             New-Item -ItemType Directory -Force -Path $env:BILILIVE_ARTIFACT_EVIDENCE_DIR | Out-Null
             New-Item -ItemType Directory -Force -Path (Split-Path $env:BILILIVE_ARTIFACT_CLI_LOG) | Out-Null
-            "BILILIVE_ARTIFACT_EVIDENCE_DIR=$env:BILILIVE_ARTIFACT_EVIDENCE_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
             Remove-Item $env:BILILIVE_ARTIFACT_CLI_LOG -Force -ErrorAction SilentlyContinue
             cargo test --manifest-path src-tauri/Cargo.toml --test artifact_lifecycle quitting_the_app_stops_the_backend -- --ignored --exact --nocapture 2>&1 | Tee-Object -FilePath (Join-Path $env:BILILIVE_ARTIFACT_EVIDENCE_DIR 'quit-test.log')
@@ -171,7 +180,11 @@ jobs:
             }
           }
           finally {
-            & msiexec.exe /x $msi.FullName /qn /norestart
+            $uninstallArgs = @('/x', ('"{0}"' -f $msi.FullName), '/qn', '/norestart')
+            $uninstall = Start-Process -FilePath msiexec.exe -ArgumentList $uninstallArgs -Wait -PassThru
+            if ($null -eq $uninstall -or $uninstall.ExitCode -ne 0) {
+              Write-Warning "MSI cleanup returned $($uninstall.ExitCode) on this disposable runner"
+            }
           }
       - name: Upload artifact lifecycle evidence
         if: always() && env.BILILIVE_ARTIFACT_EVIDENCE_DIR != ''
