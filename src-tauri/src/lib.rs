@@ -1,9 +1,36 @@
+//! BililiveRecorder GUI — a Tauri desktop shell around the official
+//! BililiveRecorder CLI, whose embedded WebUI is the only user interface.
+//!
+//! # Sidecar lifecycle guarantees
+//!
+//! The app supervises exactly one backend process: the official
+//! `BililiveRecorder.Cli` shipped inside the bundle. It is always addressed by
+//! the PID returned from `Command::spawn`. The app never enumerates processes
+//! and never signals anything by name or by process group, so a recorder the
+//! user started independently is never touched.
+//!
+//! | Exit path | Guarantee |
+//! | --- | --- |
+//! | Main window closed (`CloseRequested`) | backend shut down before the app exits |
+//! | App quit — Cmd+Q, Dock ▸ Quit, `osascript quit` | backend shut down; on macOS a normal quit only ever delivers `RunEvent::Exit`, never `CloseRequested` |
+//! | `SIGTERM` / `SIGHUP` / `SIGINT` to the app | handled explicitly; backend shut down, app exits with `128 + signal` |
+//! | App `SIGKILL`ed, crashed, panicked or aborted | a guardian process spawned next to the backend sees the app disappear through a closed pipe and shuts the backend down |
+//!
+//! Every path ends in the same two-stage shutdown: `SIGINT` first, which lets
+//! the CLI flush recordings and exit cleanly, escalating to `SIGKILL` only
+//! after [`GRACEFUL_SHUTDOWN_TIMEOUT`].
+
 use std::{
+    ffi::OsString,
     fs,
+    io::{self, Read},
     net::TcpListener,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicI32, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -11,7 +38,26 @@ use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_updater::UpdaterExt;
 
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
+
 const SIDECAR_NAME: &str = "BililiveRecorder.Cli";
+
+/// Hidden argv flag that re-runs this same executable as the sidecar guardian.
+const GUARDIAN_FLAG: &str = "--bililive-sidecar-guardian";
+
+/// How long the backend may take to shut down gracefully before it is killed.
+const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How long the guardian keeps re-reading a target's identity before deciding.
+/// Covers the instant between `fork` and `exec`, when the child still reports
+/// its parent's executable.
+const IDENTITY_SETTLE_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// Exit codes reported by the guardian process (not used by the GUI itself).
+const GUARDIAN_REAPED: i32 = 0;
+const GUARDIAN_TARGET_ALREADY_GONE: i32 = 0;
+const GUARDIAN_TARGET_UNVERIFIED: i32 = 2;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const TARGET_TRIPLE: &str = "aarch64-apple-darwin";
@@ -28,39 +74,27 @@ const TARGET_TRIPLE: &str = "x86_64-unknown-linux-musl";
 #[cfg(all(target_os = "linux", target_arch = "aarch64", target_env = "musl"))]
 const TARGET_TRIPLE: &str = "aarch64-unknown-linux-musl";
 
-struct OwnedBackend {
-    child: Option<Child>,
-}
-
-impl OwnedBackend {
-    fn new(child: Child) -> Self {
-        Self { child: Some(child) }
-    }
-
-    fn shutdown(&mut self) {
-        if let Some(child) = self.child.as_mut() {
-            shutdown_child(child, Duration::from_secs(5));
-        }
-        self.child = None;
-    }
-}
-
-impl Drop for OwnedBackend {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
 #[derive(Default)]
 struct BackendInner {
-    backend: Option<OwnedBackend>,
+    child: Option<Child>,
+    /// Kept alive so its stdin pipe stays open: the pipe closing is how the
+    /// guardian learns that this process is gone. Dropping it early would make
+    /// the guardian reap the backend while the app is still running.
+    guardian: Option<Child>,
+    stopping: bool,
 }
 
 #[derive(Default)]
 struct BackendState(Mutex<BackendInner>);
+
+impl BackendState {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BackendInner> {
+        // A panic in another thread must not turn a shutdown into a crash.
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
 
 fn reserve_local_port() -> Result<u16, String> {
     TcpListener::bind(("127.0.0.1", 0))
@@ -98,50 +132,275 @@ fn work_directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| error.to_string())
 }
 
-fn request_graceful_shutdown(pid: u32) -> Result<(), String> {
+// ---------------------------------------------------------------------------
+// Process identity — used to confirm that a PID is still the process we
+// spawned before anything is signalled. The app's primary safety property is
+// that it only ever addresses the PID returned by `Command::spawn`; this check
+// is the second line of defence against that PID having been recycled since.
+// ---------------------------------------------------------------------------
+
+/// Resolves the executable behind `pid`, or `None` when it cannot be read.
+#[cfg(unix)]
+fn process_executable(pid: u32) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        let link = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+        let text = link.to_string_lossy().into_owned();
+        // The kernel marks the link when the backing file was replaced.
+        let text = text.strip_suffix(" (deleted)").unwrap_or(&text).to_string();
+        Some(PathBuf::from(text))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        let length = unsafe {
+            libc::proc_pidpath(
+                pid as libc::c_int,
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as u32,
+            )
+        };
+        if length <= 0 {
+            return None;
+        }
+        buffer.truncate(length as usize);
+        if buffer.last() == Some(&0) {
+            buffer.pop();
+        }
+        Some(PathBuf::from(OsString::from_vec(buffer)))
+    }
+}
+
+/// True when the resolved executables refer to the same file.
+#[cfg(unix)]
+fn same_executable(left: &Path, right: &Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        // The backend may already be gone (uninstalled app): fall back to a
+        // literal comparison, which then reports a mismatch and stops us from
+        // signalling a PID we can no longer identify.
+        _ => left == right,
+    }
+}
+
+/// True while `pid` exists and can be signalled.
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    if unsafe { libc::kill(pid as libc::c_int, 0) } == 0 {
+        return true;
+    }
+    // EPERM means the process exists but belongs to another user.
+    io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Asks the backend to shut down cleanly. Returns whether the request was sent.
+fn request_graceful_shutdown(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        let result = unsafe { libc::kill(pid as i32, libc::SIGINT) };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error().to_string())
-        }
+        unsafe { libc::kill(pid as libc::c_int, libc::SIGINT) == 0 }
     }
 
     #[cfg(windows)]
     {
+        // A console-less child cannot be sent Ctrl+C; the caller escalates
+        // straight to a forced termination instead.
         let _ = pid;
-        Err("Windows 无法向无控制台后端发送 Ctrl+C。".into())
+        false
     }
 }
 
-fn shutdown_child(child: &mut Child, timeout: Duration) {
-    let _ = request_graceful_shutdown(child.id());
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) => {}
+/// Terminates the backend without giving it a chance to clean up.
+#[cfg(unix)]
+fn force_terminate(pid: u32) {
+    unsafe { libc::kill(pid as libc::c_int, libc::SIGKILL) };
+}
+
+/// Walks `pid` through the two-stage shutdown and returns once it is gone.
+#[cfg(unix)]
+fn shutdown_process(pid: u32, timeout: Duration) {
+    if !process_alive(pid) {
+        return;
+    }
+
+    if request_graceful_shutdown(pid) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if !process_alive(pid) {
+                return;
+            }
+            std::thread::sleep(SHUTDOWN_POLL_INTERVAL);
+        }
+    }
+
+    force_terminate(pid);
+}
+
+// ---------------------------------------------------------------------------
+// Guardian: survives this process and reaps the backend if we vanish without
+// running any shutdown code at all (SIGKILL, crash, panic, abort).
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReapTarget {
+    pub pid: u32,
+    pub executable: PathBuf,
+}
+
+impl ReapTarget {
+    /// Parses `["<exe>", GUARDIAN_FLAG, "<pid>", "<sidecar path>"]`.
+    pub fn from_args<I, S>(args: I) -> Option<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        let mut args = args.into_iter().map(Into::into);
+        let _executable = args.next()?;
+        if args.next()? != OsString::from(GUARDIAN_FLAG) {
+            return None;
+        }
+        let pid = args.next()?.to_string_lossy().parse().ok()?;
+        let executable = PathBuf::from(args.next()?);
+        Some(Self { pid, executable })
+    }
+}
+
+/// Parses the guardian target from the real process arguments.
+pub fn guardian_target() -> Option<ReapTarget> {
+    ReapTarget::from_args(std::env::args_os())
+}
+
+/// Reaps the target once `input` reaches end of file.
+///
+/// The GUI holds the write end of that pipe for its whole lifetime, so end of
+/// file means the GUI is gone — the only signal that also fires when it was
+/// killed outright.
+#[cfg(unix)]
+pub fn guard<R: Read>(input: &mut R, target: &ReapTarget) -> i32 {
+    guard_with_timeout(input, target, GRACEFUL_SHUTDOWN_TIMEOUT)
+}
+
+/// [`guard`] with an explicit graceful-shutdown budget.
+#[cfg(unix)]
+pub fn guard_with_timeout<R: Read>(input: &mut R, target: &ReapTarget, timeout: Duration) -> i32 {
+    let mut scratch = [0u8; 64];
+    loop {
+        match input.read(&mut scratch) {
+            Ok(0) => break,
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            // A read error is not proof that the app is gone, but the pipe is
+            // the only supervision channel we have; treat it as a disconnect.
             Err(_) => break,
         }
-        std::thread::sleep(Duration::from_millis(100));
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
+    if !process_alive(target.pid) {
+        return GUARDIAN_TARGET_ALREADY_GONE;
+    }
+
+    // A positive mismatch is proof that the PID now belongs to a different
+    // program, so nothing is signalled. An identity that cannot be read at all
+    // is not proof of anything: refusing there would resurrect the orphaned
+    // backend this guardian exists to prevent, and the target PID was alive and
+    // ours only moments ago.
+    let deadline = Instant::now() + IDENTITY_SETTLE_TIMEOUT;
+    loop {
+        match process_executable(target.pid) {
+            Some(actual) if same_executable(&actual, &target.executable) => break,
+            Some(_) => {
+                if Instant::now() >= deadline {
+                    return GUARDIAN_TARGET_UNVERIFIED;
+                }
+            }
+            None => break,
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    shutdown_process(target.pid, timeout);
+    GUARDIAN_REAPED
 }
 
+/// Entry point used when the binary is re-run with [`GUARDIAN_FLAG`].
+///
+/// Only Unix builds ship a guardian: a *correct* Windows equivalent has to be a
+/// Job Object with `KILL_ON_JOB_CLOSE`, which needs Win32 bindings this project
+/// does not carry yet. On Windows the guardian is simply absent and the in-app
+/// exit paths do the work.
+#[cfg(unix)]
+pub fn run_guardian(target: &ReapTarget) -> i32 {
+    guard(&mut io::stdin(), target)
+}
+
+#[cfg(unix)]
+fn spawn_guardian(sidecar_pid: u32, sidecar: &Path) -> Result<Child, String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let mut command = Command::new(executable);
+    command
+        .arg(GUARDIAN_FLAG)
+        .arg(sidecar_pid.to_string())
+        .arg(sidecar)
+        // Piped and never written to: the GUI holds the write end so that the
+        // pipe closes exactly when this process dies.
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command.spawn().map_err(|error| error.to_string())
+}
+
+#[cfg(not(unix))]
+fn spawn_guardian(_sidecar_pid: u32, _sidecar: &Path) -> Result<Child, String> {
+    Err("当前平台未提供 sidecar 守护进程。".into())
+}
+
+// ---------------------------------------------------------------------------
+// Backend supervision
+// ---------------------------------------------------------------------------
+
 fn stop_backend(app: &tauri::AppHandle) {
-    let mut backend = app
-        .state::<BackendState>()
-        .0
-        .lock()
-        .expect("backend state lock poisoned")
-        .backend
-        .take();
-    if let Some(backend) = backend.as_mut() {
-        backend.shutdown();
+    let state = app.state::<BackendState>();
+
+    let child = {
+        let mut inner = state.lock();
+        // Marked before the child is taken so `monitor_backend` never reports
+        // this as an unexpected exit.
+        inner.stopping = true;
+        inner.child.take()
+    };
+
+    if let Some(mut child) = child {
+        let pid = child.id();
+        if request_graceful_shutdown(pid) {
+            let deadline = Instant::now() + GRACEFUL_SHUTDOWN_TIMEOUT;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(SHUTDOWN_POLL_INTERVAL);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        // Also reached when the backend ignored SIGINT, or when it could not be
+        // asked politely in the first place (Windows).
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    // The backend is confirmed down, so the guardian has nothing left to do.
+    // Closing its stdin lets it exit instead of lingering until this process
+    // disappears; it re-checks the backend before acting either way.
+    let guardian = state.lock().guardian.take();
+    if let Some(mut guardian) = guardian {
+        drop(guardian.stdin.take());
+        std::thread::spawn(move || {
+            let _ = guardian.wait();
+        });
     }
 }
 
@@ -151,24 +410,19 @@ fn monitor_backend(app: tauri::AppHandle) {
             tokio::time::sleep(Duration::from_millis(250)).await;
             let state = app.state::<BackendState>();
             let exited_unexpectedly = {
-                let mut inner = state.0.lock().expect("backend state lock poisoned");
-                let Some(backend) = inner.backend.as_mut() else {
-                    break;
-                };
-                let Some(child) = backend.child.as_mut() else {
-                    inner.backend = None;
+                let mut inner = state.lock();
+                let Some(child) = inner.child.as_mut() else {
                     break;
                 };
                 match child.try_wait() {
                     Ok(Some(_)) => {
-                        backend.child = None;
-                        inner.backend = None;
-                        true
+                        let unexpected = !inner.stopping;
+                        inner.child = None;
+                        unexpected
                     }
                     Ok(None) => false,
                     Err(_) => {
-                        backend.child = None;
-                        inner.backend = None;
+                        inner.child = None;
                         true
                     }
                 }
@@ -227,10 +481,25 @@ async fn start_backend(app: &tauri::AppHandle) -> Result<String, String> {
     let child = command
         .spawn()
         .map_err(|error| format!("无法启动录播后端：{error}"))?;
+    let sidecar_pid = child.id();
+
+    // Started before the guardian so that nothing else can inherit the pipe.
+    let guardian = match spawn_guardian(sidecar_pid, &executable) {
+        Ok(guardian) => Some(guardian),
+        Err(error) => {
+            // Losing the guardian only costs the crash/SIGKILL path; every
+            // other exit path still shuts the backend down.
+            eprintln!("无法启动 sidecar 守护进程：{error}");
+            None
+        }
+    };
+
     {
         let state = app.state::<BackendState>();
-        let mut inner = state.0.lock().map_err(|error| error.to_string())?;
-        inner.backend = Some(OwnedBackend::new(child));
+        let mut inner = state.lock();
+        inner.child = Some(child);
+        inner.stopping = false;
+        inner.guardian = guardian;
     }
     monitor_backend(app.clone());
 
@@ -280,7 +549,12 @@ async fn check_for_updates(app: tauri::AppHandle) {
     }
 
     match update.download_and_install(|_, _| {}, || {}).await {
-        Ok(()) => app.restart(),
+        Ok(()) => {
+            // Shut the backend down before handing over to the new build so two
+            // CLI instances never overlap.
+            stop_backend(&app);
+            app.restart();
+        }
         Err(error) => {
             app.dialog()
                 .message(format!("更新安装失败：{error}"))
@@ -316,14 +590,60 @@ async fn launch_main_window(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Termination signals
+//
+// A signal handler may only touch async-signal-safe state, so it records the
+// number and a watcher thread performs the actual shutdown.
+// ---------------------------------------------------------------------------
+
+static PENDING_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+#[cfg(unix)]
+extern "C" fn record_signal(signal: libc::c_int) {
+    PENDING_SIGNAL.store(signal, Ordering::SeqCst);
+}
+
+#[cfg(unix)]
+fn install_signal_handlers() {
+    for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+        unsafe {
+            libc::signal(signal, record_signal as *const () as libc::sighandler_t);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn install_signal_handlers() {}
+
+#[cfg(unix)]
+fn watch_for_signals(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(SHUTDOWN_POLL_INTERVAL);
+            let signal = PENDING_SIGNAL.load(Ordering::SeqCst);
+            if signal != 0 {
+                stop_backend(&app);
+                std::process::exit(128 + signal);
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn watch_for_signals(_app: tauri::AppHandle) {}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    install_signal_handlers();
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(BackendState::default())
         .setup(|app| {
             let handle = app.handle().clone();
+            watch_for_signals(handle.clone());
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = launch_main_window(handle.clone()).await {
                     handle
@@ -342,7 +662,11 @@ pub fn run() {
                 && let tauri::WindowEvent::CloseRequested { api, .. } = event
             {
                 api.prevent_close();
+                // Reaping here, before the window goes away, keeps the backend
+                // from outliving its UI. `RunEvent::Exit` runs the same
+                // idempotent shutdown again and finds nothing left to do.
                 stop_backend(window.app_handle());
+                let _ = window.hide();
                 window.app_handle().exit(0);
             }
         })
@@ -350,65 +674,47 @@ pub fn run() {
         .expect("error while building BililiveRecorder GUI");
 
     app.run(|app, event| {
-        if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
+        // `Exit` is the event a normal macOS quit delivers (`applicationWillTerminate`
+        // -> `LoopDestroyed`); `ExitRequested` covers closes and `exit()` calls.
+        // Both are handled because either can be the last one to run.
+        if matches!(
+            event,
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+        ) {
             stop_backend(app);
         }
     });
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn shutdown_only_stops_the_owned_child() {
-        let mut owned = OwnedBackend::new(
-            Command::new("sleep")
-                .arg("30")
-                .spawn()
-                .expect("owned test child should start"),
-        );
-        let mut independent = OwnedBackend::new(
-            Command::new("sleep")
-                .arg("30")
-                .spawn()
-                .expect("independent test child should start"),
-        );
-
-        owned.shutdown();
-
-        assert!(owned.child.is_none());
-        assert!(
-            independent
-                .child
-                .as_mut()
-                .expect("independent child should still be tracked")
-                .try_wait()
-                .expect("independent child status should be readable")
-                .is_none()
+    fn parses_guardian_arguments() {
+        let target = ReapTarget::from_args([
+            "/Applications/BililiveRecorder GUI.app/Contents/MacOS/bililive-recorder-gui",
+            GUARDIAN_FLAG,
+            "4242",
+            "/Applications/BililiveRecorder GUI.app/Contents/Resources/sidecar/BililiveRecorder.Cli",
+        ])
+        .expect("guardian arguments should parse");
+        assert_eq!(target.pid, 4242);
+        assert_eq!(
+            target.executable,
+            PathBuf::from(
+                "/Applications/BililiveRecorder GUI.app/Contents/Resources/sidecar/BililiveRecorder.Cli"
+            )
         );
     }
 
     #[test]
-    fn dropping_owned_backend_reaps_its_child() {
-        let backend = OwnedBackend::new(
-            Command::new("sleep")
-                .arg("30")
-                .spawn()
-                .expect("test child should start"),
-        );
-        let pid = backend
-            .child
-            .as_ref()
-            .expect("child should be tracked")
-            .id();
-
-        drop(backend);
-
-        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
-        );
+    fn ignores_ordinary_invocations() {
+        assert!(ReapTarget::from_args(["bililive-recorder-gui"]).is_none());
+        assert!(ReapTarget::from_args(["app", "--some-other-flag", "1"]).is_none());
+        // Missing the executable argument.
+        assert!(ReapTarget::from_args(["app", GUARDIAN_FLAG, "12"]).is_none());
+        // Non-numeric PID.
+        assert!(ReapTarget::from_args(["app", GUARDIAN_FLAG, "abc", "/tmp/x"]).is_none());
     }
 }

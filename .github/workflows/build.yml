@@ -47,6 +47,8 @@ jobs:
         run: |
           test ! -e src-tauri/sidecar/${{ matrix.target }}/libcoreclrtraceptprovider.so
           src-tauri/sidecar/${{ matrix.target }}/BililiveRecorder.Cli --version
+      - name: Sidecar lifecycle regression tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
       - uses: tauri-apps/tauri-action@v0
         with:
           args: -vv --target ${{ matrix.target }} --config '{"bundle":{"createUpdaterArtifacts":false}}'
