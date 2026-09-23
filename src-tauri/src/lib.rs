@@ -1066,6 +1066,38 @@ fn watch_for_signals(app: tauri::AppHandle) {
 #[cfg(not(unix))]
 fn watch_for_signals(_app: tauri::AppHandle) {}
 
+// A test-only control pipe, enabled explicitly on the app spawned by the
+// disposable-runner harness. It asks the exact Tauri main window to close;
+// never bypass CloseRequested by calling exit(), destroy(), or stop_backend().
+#[cfg(windows)]
+fn install_artifact_close_driver(app: tauri::AppHandle) {
+    if !artifact_probe::enabled() {
+        return;
+    }
+    std::thread::spawn(move || {
+        match artifact_probe::read_close_request(io::stdin().lock()) {
+            Ok(true) => {
+                artifact_probe::record("close-command-received");
+                match app.get_webview_window("main") {
+                    Some(window) => match window.close() {
+                        Ok(()) => artifact_probe::record("close-command-posted"),
+                        Err(error) => {
+                            artifact_probe::record("close-command-failed");
+                            eprintln!("artifact close request failed: {error}");
+                        }
+                    },
+                    None => artifact_probe::record("close-command-no-window"),
+                }
+            }
+            Ok(false) => {} // EOF or an unknown command is not a close request.
+            Err(error) => eprintln!("artifact control pipe failed: {error}"),
+        }
+    });
+}
+
+#[cfg(not(windows))]
+fn install_artifact_close_driver(_app: tauri::AppHandle) {}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     install_signal_handlers();
@@ -1076,6 +1108,7 @@ pub fn run() {
         .manage(BackendState::default())
         .setup(|app| {
             let handle = app.handle().clone();
+            install_artifact_close_driver(handle.clone());
             watch_for_signals(handle.clone());
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = launch_main_window(handle.clone()).await {

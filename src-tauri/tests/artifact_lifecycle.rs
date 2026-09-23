@@ -146,7 +146,11 @@ impl App {
             .env("BILILIVE_GUI_BIND_PORT", port.to_string())
             .env("BILILIVE_ARTIFACT_TRACE", &trace)
             .env("BILILIVE_RECORDER_GUI_WORKDIR", run.join("recordings"))
-            .stdin(Stdio::null())
+            .stdin(if cfg!(windows) {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::from(output.try_clone().expect("clone app log")))
             .stderr(Stdio::from(output));
         #[cfg(windows)]
@@ -190,8 +194,8 @@ impl App {
     /// The app's pid. Safe to signal only while `self.child` is unreaped, which
     /// is exactly what the callers below guarantee by construction.
     ///
-    /// macOS asks the app to quit by Apple Event instead, so it does not use
-    /// this; the pid is still what `taskkill` and the signals need.
+    /// Unix signals use this. Windows normal quit uses the owned stdin pipe,
+    /// and trace matching uses the PID only to identify the writer.
     #[allow(dead_code)]
     fn pid(&self) -> u32 {
         self.child.id()
@@ -201,7 +205,7 @@ impl App {
     ///
     /// This is the path that was broken: on macOS a normal quit delivers
     /// `RunEvent::Exit` and never `CloseRequested`.
-    fn request_quit(&self) {
+    fn request_quit(&mut self) {
         #[cfg(target_os = "macos")]
         {
             // Apple Event `quit`, by executable name. Not yet observed to work
@@ -216,19 +220,14 @@ impl App {
 
         #[cfg(windows)]
         {
-            // TCP readiness happens before the Tauri window is even created.
-            // Wait for the actual GUI, then require the app to acknowledge the
-            // close event: taskkill's exit code alone is not delivery evidence.
-            request_quit_when_ready(&self.trace, self.pid(), STARTUP, SETTLE, || {
-                let status = Command::new("taskkill")
-                    .args(["/PID", &self.pid().to_string()])
-                    .status()
-                    .map_err(|error| error.to_string())?;
-                if status.success() {
-                    Ok(())
-                } else {
-                    Err(format!("taskkill failed: {status}"))
-                }
+            // CI proved taskkill can report success after GUI readiness yet
+            // never reach CloseRequested. Use the app's opt-in owned pipe to
+            // call Tauri main.close(), which still traverses the real callback.
+            let pid = self.pid();
+            let child = &mut self.child;
+            request_quit_when_ready(&self.trace, pid, STARTUP, SETTLE, || {
+                let input = child.stdin.as_mut().ok_or("app control pipe missing")?;
+                artifact_probe::write_close_request(input).map_err(|error| error.to_string())
             })
             .unwrap_or_else(|error| panic!("{error}"));
         }

@@ -1,10 +1,35 @@
 //! Opt-in, observation-only lifecycle trace for disposable-runner tests.
 //! The parent creates a fresh file and passes its path; ordinary launches do
 //! not open any file. A marker records control flow, NOT recording integrity.
-use std::{fs::OpenOptions, io::Write, path::Path};
+use std::{
+    fs::OpenOptions,
+    io::{BufRead, Write},
+    path::Path,
+};
+
+pub const CLOSE_COMMAND: &str = "bililive-artifact-close-main-window";
+
+pub fn enabled() -> bool {
+    std::env::var("BILILIVE_ARTIFACT_OK").as_deref() == Ok("1")
+        && std::env::var_os("BILILIVE_ARTIFACT_TRACE").is_some()
+}
+
+/// The test parent owns this pipe; there is no listener or PID lookup.
+pub fn write_close_request(writer: &mut impl Write) -> std::io::Result<()> {
+    writeln!(writer, "{CLOSE_COMMAND}")?;
+    writer.flush()
+}
+
+pub fn read_close_request(mut reader: impl BufRead) -> std::io::Result<bool> {
+    let mut command = String::new();
+    if reader.read_line(&mut command)? == 0 {
+        return Ok(false);
+    }
+    Ok(command.trim_end_matches(['\r', '\n']) == CLOSE_COMMAND)
+}
 
 pub fn record(event: &str) {
-    if std::env::var("BILILIVE_ARTIFACT_OK").as_deref() != Ok("1") {
+    if !enabled() {
         return;
     }
     if let Some(path) = std::env::var_os("BILILIVE_ARTIFACT_TRACE") {
@@ -33,6 +58,8 @@ pub fn close_progress(trace: &str, pid: u32) -> &'static str {
         ("stop-backend-returned", "SHUTDOWN_RETURNED"),
         ("stop-backend-start", "SHUTDOWN_ENTERED_NOT_RETURNED"),
         ("close-requested", "CLOSE_DELIVERED"),
+        ("close-command-posted", "CLOSE_POSTED_NO_CLOSE_EVENT"),
+        ("close-command-received", "CLOSE_COMMAND_RECEIVED"),
         ("main-window-ready", "GUI_READY_NO_CLOSE_EVENT"),
     ] {
         if contains(trace, pid, event) {
@@ -45,6 +72,15 @@ pub fn close_progress(trace: &str, pid: u32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_protocol_round_trip_and_rejection() {
+        let mut pipe = Vec::new();
+        write_close_request(&mut pipe).unwrap();
+        assert!(read_close_request(std::io::Cursor::new(pipe)).unwrap());
+        assert!(!read_close_request(std::io::Cursor::new(b"")).unwrap());
+        assert!(!read_close_request(std::io::Cursor::new(b"wrong command\n")).unwrap());
+    }
 
     #[test]
     fn markers_require_own_pid_exact_event_and_complete_line() {

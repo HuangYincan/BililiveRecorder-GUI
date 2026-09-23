@@ -24,8 +24,15 @@ there is no evidence in that old run distinguishing delivery from shutdown.
    owned app process does not exit. Prediction: exit-invoked without successful
    child wait. A run-exit marker alone is not proof of process termination.
 
-These are hypotheses until the new runner evidence is collected, not a claim
-that the old failure was conclusively diagnosed from a successful taskkill.
+Run `35858098177` (head `2c78cc1`) now separates these hypotheses: the
+Windows normal-quit trace contains backend-ready, main-window-created and
+main-window-ready, taskkill reports success, but CloseRequested is never
+observed during the bounded acknowledgment wait. Neither shutdown-start nor
+exit markers appear, and the app-output log contains no trace-write error.
+Thus readiness alone did not fix this: the request did not reach our app's
+close handler; there is no observed guardian-shutdown hang in this path.
+The separately executed forced-kill case passed 1/1 and reported no clean CLI
+shutdown. That is not recording-file integrity evidence.
 
 ## Opt-in observation interface
 
@@ -43,14 +50,23 @@ the exact event, and a newline; another process or incomplete line cannot
 acknowledge a request. Ordinary app launches do not open a trace file.
 
 Markers: `backend-ready`, `main-window-created`, `main-window-ready`,
-`close-requested`, `stop-backend-start`, `guardian-wait-exited` or
+`close-command-received`, `close-command-posted`, `close-requested`, `stop-backend-start`, `guardian-wait-exited` or
 `guardian-wait-unsettled`, `stop-backend-returned`, `exit-invoked`,
 `run-exit-requested`, `run-exit`.
 
-The Windows normal-quit driver now waits for `main-window-ready`, runs the
-existing `taskkill /PID` against its own spawned app, and requires the app's
-`close-requested` acknowledgment. Ready and acknowledgment waits are bounded.
-Successful driver return without acknowledgment is explicitly a failure.
+The corrected Windows normal-quit driver waits for `main-window-ready`, then
+writes one fixed command to its own `Child::stdin` pipe. Only an app opted in
+with both artifact variables installs the reader. It addresses the app's
+logical `main` window through `WebviewWindow::close()`, which traverses the
+real CloseRequested callback; it does NOT call destroy(), stop_backend() or
+app.exit() as a shortcut. There is no network control endpoint, raw HWND/PID
+lookup, or process/window enumeration. EOF/unknown input does not request exit.
+
+The test then requires the app's `close-requested` acknowledgment. Ready and
+acknowledgment waits are bounded. A successful pipe write or posted close
+without the callback is explicitly a failure. The intermediate command markers
+distinguish pipe receipt from runtime delivery. This interface tests the real
+Tauri normal-close path, not taskkill behavior or OS-level mouse injection.
 An acknowledged close is still not a pass: the existing owned-process exit
 and backend-service checks must independently succeed. Failure output names
 the last observed phase; Drop prints the trace before fixture cleanup.
