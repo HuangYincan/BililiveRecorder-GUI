@@ -25,6 +25,7 @@ jobs:
       TAURI_TARGET_TRIPLE: ${{ matrix.target }}
       APPIMAGE_EXTRACT_AND_RUN: "1"
       NO_STRIP: "1"
+      RUST_BACKTRACE: "1"
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -43,4 +44,4 @@ jobs:
       - run: npm run sidecar:prepare
       - uses: tauri-apps/tauri-action@v0
         with:
-          args: --target ${{ matrix.target }} --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          args: -vv --target ${{ matrix.target }} --config '{"bundle":{"createUpdaterArtifacts":false}}'

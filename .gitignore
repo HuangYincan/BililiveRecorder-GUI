@@ -16,3 +16,4 @@ src-tauri/sidecar/*
 .lifecycle-*-workdir/
 bililive-recorder-webui-main.png
 bililive-recorder-webui-lifecycle.png
+.release-audit/

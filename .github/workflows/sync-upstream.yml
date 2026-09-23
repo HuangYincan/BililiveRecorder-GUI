@@ -4,8 +4,15 @@ on:
   schedule:
     - cron: "23 3 * * *"
   workflow_dispatch:
+    inputs:
+      verify_release_chain:
+        description: "Create a harmless sync PR to verify auto-merge and release dispatch"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -20,6 +27,19 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run upstream:sync
+      - name: Record release-chain verification
+        if: inputs.verify_release_chain
+        env:
+          RUN_ID: ${{ github.run_id }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          node - <<'NODE'
+          const { writeFileSync } = require('node:fs');
+          writeFileSync('.github/upstream-sync-verification.json', `${JSON.stringify({
+            verifiedAt: new Date().toISOString(),
+            workflowRun: `https://github.com/${process.env.REPOSITORY}/actions/runs/${process.env.RUN_ID}`,
+          }, null, 2)}\n`);
+          NODE
       - run: npm install --package-lock-only --ignore-scripts
       - id: create-pull-request
         uses: peter-evans/create-pull-request@v7
@@ -40,3 +60,24 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh pr merge --auto --squash "${{ steps.create-pull-request.outputs.pull-request-number }}"
+      - name: Dispatch release after merge
+        if: steps.create-pull-request.outputs.pull-request-number
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.create-pull-request.outputs.pull-request-number }}
+        run: |
+          for attempt in $(seq 1 60); do
+            MERGED_AT=$(gh pr view "$PR_NUMBER" --json mergedAt --jq '.mergedAt // empty')
+            if [ -n "$MERGED_AT" ]; then
+              gh workflow run release.yml --ref main -f source_pr="$PR_NUMBER"
+              exit 0
+            fi
+            STATE=$(gh pr view "$PR_NUMBER" --json state --jq .state)
+            if [ "$STATE" = "CLOSED" ]; then
+              echo "Sync PR #${PR_NUMBER} closed without merging" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "Timed out waiting for sync PR #${PR_NUMBER} to merge" >&2
+          exit 1
