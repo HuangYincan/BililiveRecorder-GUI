@@ -40,7 +40,7 @@ function run(program, args, timeout = 240_000) {
 }
 
 function onlyPackage(dir, suffix) {
-  const packages = filesUnder(dir, (path) => path.endsWith(suffix));
+  const packages = filesUnder(dir, (path) => path.replaceAll('\\', '/').endsWith(suffix));
   if (packages.length !== 1) throw new Error(`Expected one ${suffix} package in ${dir}, found ${packages.length}`);
   return packages[0];
 }
