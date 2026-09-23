@@ -625,6 +625,22 @@ fn report_fatal(app: &tauri::AppHandle, message: &str) {
         .blocking_show();
 }
 
+/// Reports a problem without holding the caller.
+///
+/// Used on the exit path. A modal dialog there would block the main thread
+/// while the run loop is already ending, which can stop the app from exiting at
+/// all — trading "the backend may outlive the app" for "the app never quits".
+/// That is a worse outcome than the one being reported, so the message goes to
+/// stderr as well, where it survives even if no dialog is ever shown.
+fn report_warning(app: &tauri::AppHandle, message: &str) {
+    eprintln!("bililive-recorder-gui: {message}");
+    app.dialog()
+        .message(message)
+        .title("BililiveRecorder")
+        .kind(MessageDialogKind::Error)
+        .show(|_| {});
+}
+
 /// Watches the guardian's event pipe.
 ///
 /// The guardian writes exactly one line before exiting, so end of file without
@@ -726,7 +742,7 @@ fn stop_backend(app: &tauri::AppHandle) {
                 "录播后端守护进程无响应，且本平台无法安全回收它启动的录播后端（进程号 {pid}）；该后端可能仍在运行，需要手工停止。"
             )
         };
-        report_fatal(app, &detail);
+        report_warning(app, &detail);
     }
 }
 

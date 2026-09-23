@@ -235,13 +235,9 @@ impl App {
         false
     }
 
-    /// Reaps the app, returning its exit code. Nothing may signal it
-    /// afterwards.
-    fn reap(&mut self) -> Option<i32> {
-        self.child
-            .wait()
-            .ok()
-            .map(|status| status.code().unwrap_or(-1))
+    /// Waits for the app to exit, up to a deadline. See [`wait_for_exit`].
+    fn reap_within(&mut self, within: Duration) -> Option<i32> {
+        wait_for_exit(&mut self.child, within)
     }
 }
 
@@ -294,6 +290,27 @@ fn recording_was_flushed(since: u64) -> Option<bool> {
     Some(text.contains("Shutdown in progress") || text.contains("Dispose called"))
 }
 
+/// Waits for `child` to exit, up to a deadline, returning its exit code.
+///
+/// Deliberately **not** `Child::wait`: this tool asks the app to quit through
+/// drivers whose effect is not yet established on every platform (see
+/// `request_quit`), and if one of them silently does nothing an unbounded wait
+/// hangs the run instead of failing it. A test that hangs proves nothing and
+/// reports nothing — on CI it burns the job to its timeout and leaves no
+/// diagnostic — so the wait is bounded and the absence of an exit becomes the
+/// assertion instead.
+fn wait_for_exit(child: &mut Child, within: Duration) -> Option<i32> {
+    let deadline = Instant::now() + within;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status.code().unwrap_or(-1)),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+            // Still running when the time ran out, or unwaitable.
+            _ => return None,
+        }
+    }
+}
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .expect("a free port")
@@ -313,15 +330,19 @@ fn quitting_the_app_stops_the_backend() {
 
     let stopped_serving = app.observe_backend_shutdown();
     let flushed = recording_was_flushed(app.log_length_before);
-    let exit = app.reap();
+    let exit = app.reap_within(SETTLE);
 
-    assert!(
-        stopped_serving,
-        "the backend was still serving after the app was asked to quit"
-    );
+    // The app exiting is checked before the backend is, so a quit driver that
+    // silently did nothing is reported as exactly that rather than as a
+    // backend that kept serving.
     assert!(
         exit.is_some(),
-        "the app was never reaped after being asked to quit"
+        "the app never exited after being asked to quit — either the quit was \
+         not delivered or the app hung on its way out"
+    );
+    assert!(
+        stopped_serving,
+        "the app exited but the backend was still serving"
     );
     if flushed == Some(false) {
         panic!(
@@ -348,8 +369,12 @@ fn killing_the_app_stops_the_backend() {
 
     let stopped_serving = app.observe_backend_shutdown();
     let flushed = recording_was_flushed(app.log_length_before);
-    let _ = app.reap();
+    let exit = app.reap_within(SETTLE);
 
+    assert!(
+        exit.is_some(),
+        "the app did not exit after being killed outright"
+    );
     assert!(
         stopped_serving,
         "the backend outlived an app that was killed outright"
@@ -360,4 +385,65 @@ fn killing_the_app_stops_the_backend() {
         Some(value) => eprintln!("note: CLI reported a clean shutdown: {value}"),
         None => eprintln!("note: flush signal UNPROVEN (no CLI log supplied)"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The wait itself, which needs no app and therefore runs everywhere
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_child_that_does_not_exit_is_reported_rather_than_waited_on_forever() {
+    // The regression this pins: the first version of this tool called
+    // `Child::wait`, so a quit driver that silently did nothing hung the run
+    // instead of failing it. Nothing here launches the app, so unlike the two
+    // artifact cases above this one runs normally on every platform.
+    let mut stubborn = Command::new(if cfg!(windows) { "cmd" } else { "/bin/sh" })
+        .args(if cfg!(windows) {
+            ["/C", "ping -n 30 127.0.0.1 >NUL"]
+        } else {
+            ["-c", "exec sleep 30"]
+        })
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the stand-in should start");
+
+    let started = Instant::now();
+    let outcome = wait_for_exit(&mut stubborn, Duration::from_millis(400));
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        outcome, None,
+        "a running child must be reported as not exited"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the wait must be bounded, took {elapsed:?}"
+    );
+
+    // Still this test's own process, still unreaped: killing it is exact.
+    let _ = stubborn.kill();
+    let _ = stubborn.wait();
+}
+
+#[test]
+fn a_child_that_exits_reports_its_code() {
+    let mut quick = Command::new(if cfg!(windows) { "cmd" } else { "/bin/sh" })
+        .args(if cfg!(windows) {
+            ["/C", "exit 3"]
+        } else {
+            ["-c", "exit 3"]
+        })
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the stand-in should start");
+
+    assert_eq!(
+        wait_for_exit(&mut quick, Duration::from_secs(10)),
+        Some(3),
+        "an exited child must report its code"
+    );
 }

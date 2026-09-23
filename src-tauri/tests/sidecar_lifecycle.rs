@@ -28,6 +28,10 @@ const SHELL: &str = "/bin/sh";
 
 /// How long a stand-in backend stays alive when nothing stops it.
 const LINGER: &str = "300";
+/// How long the stubborn stand-in in the hung-guardian test lives. It is short
+/// on purpose: that test must not have to signal a pid it read from a file in
+/// order to clean up, so the process ends itself.
+const SELF_LIMITING: u64 = 6;
 
 fn backend(script: &str, graceful: Duration) -> GuardianConfig {
     GuardianConfig {
@@ -593,7 +597,7 @@ fn a_hung_guardian_is_left_alone_where_ending_it_would_orphan_the_backend() {
         .args([
             "-c",
             &format!(
-                "sh -c 'trap \"\" TERM; exec sleep 300' & echo $! > {}; trap \"\" TERM; wait",
+                "sh -c 'trap \"\" TERM; exec sleep {SELF_LIMITING}' & echo $! > {}; trap \"\" TERM; wait",
                 pid_file.display()
             ),
         ])
@@ -640,11 +644,16 @@ fn a_hung_guardian_is_left_alone_where_ending_it_would_orphan_the_backend() {
         );
     }
 
-    // Clean up only what this test created, and only by handles it holds.
+    // Clean up by ownership only. The guardian is this test's own `Child`, so
+    // killing it is exact. The stand-in child is deliberately self-limiting
+    // instead of being signalled by the pid this test read from a file —
+    // signalling a recorded pid is the very thing under test here, and a test
+    // that does it would be arguing against its own subject.
     let _ = guardian.kill();
     let _ = guardian.wait();
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(child_pid as libc::c_int, libc::SIGKILL);
-    }
+    wait_until(
+        "the stand-in child to reach its own end",
+        Duration::from_secs(SELF_LIMITING + 5),
+        || !alive(child_pid),
+    );
 }
