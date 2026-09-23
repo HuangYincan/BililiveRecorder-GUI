@@ -25,39 +25,29 @@
 //! | `SIGTERM` / `SIGHUP` / `SIGINT` to the app | handled explicitly, same shutdown, app exits with `128 + signal` |
 //! | App `SIGKILL`ed, crashed, panicked or aborted | the guardian notices the app disappear through a closed pipe and shuts the backend down on its own |
 //!
-//! Shutdown is two-stage everywhere: `SIGINT` first so the CLI can flush
-//! recordings and exit cleanly, escalating to `SIGKILL` only after
+//! Shutdown is two-stage: Unix `SIGINT` or Windows scoped `CTRL_BREAK_EVENT`
+//! first so the CLI can flush
+//! recordings and exit cleanly, escalating to hard termination only after
 //! [`GUARDIAN_GRACEFUL_TIMEOUT`].
 //!
 //! # Platform support boundary
 //!
-//! **Only macOS has been measured. No cross-platform guarantee is claimed.**
+//! Cross-platform evidence must be tied to a specific head and disposable
+//! runner. Local unit tests and target-only type checks do not prove installed
+//! app behavior, process-tree reclamation, or recording-file integrity.
 //!
-//! The guardian uses nothing platform-specific — one `Child` plus two pipes —
-//! so it builds and ships for Windows and Linux too, and the ownership argument
-//! carries over unchanged: Windows likewise will not hand out a pid while a
-//! handle to that process object is open, and `Child` holds one until `wait`.
-//! But that is reasoning, not measurement. For Windows specifically, none of
-//! the following has ever been observed:
+//! Windows gives the guardian a private hidden console and spawns the backend
+//! in a new control group. `CTRL_BREAK_EVENT` addresses only that owned group,
+//! reaching the CLI's CancelKeyPress shutdown handler before bounded escalation.
+//! No existing console is attached and group zero is never targeted. Existing
+//! standard handles are restored so the guardian retains its keepalive/event
+//! pipes. Console or Job Object setup failure refuses to spawn the backend.
 //!
-//! * whether the app's death reliably closes the write end of the pipe the
-//!   guardian blocks on, so that it actually sees end of file — the entire
-//!   crash and `SIGKILL` path depends on this;
-//! * whether anything else ends up holding a copy of that write end, which
-//!   would keep the guardian from ever waking;
-//! * how the guardian starts and exits when launched without a console.
-//!
-//! Windows also cannot be asked politely: a console-less child cannot be sent
-//! `Ctrl+C`, so shutdown there is a forced termination that gives the CLI no
-//! chance to flush.
-//!
-//! What *has* been checked is narrower than running it. `platform.rs` — the
-//! job object, `PR_SET_PDEATHSIG`, and the two ways of asking the kernel for a
-//! process's children — type-checks for all three targets, by way of a minimal
-//! crate that avoids tauri's C dependencies (`cargo check` needs no linker, but
-//! `aws-lc-sys` wants `windows.h` and `gdk-sys` wants GTK, so the crate as a
-//! whole cannot be cross-checked). Type-checking is not running, and none of it
-//! has run on Windows or Linux.
+//! Linux parent-death and Windows Job Object containment remain the kernel
+//! fallback when a guardian is killed. The platform module can be independently
+//! type-checked without Tauri's target C dependencies, but its native behavior
+//! is checked only by the actual isolated-runner artifact cases. A clean
+//! shutdown log is not proof that any particular recording file is complete.
 //!
 //! # When the guardian itself dies or hangs
 //!
@@ -317,9 +307,12 @@ fn send_interrupt(pid: u32) -> bool {
         unsafe { libc::kill(pid as libc::c_int, libc::SIGINT) == 0 }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        // A console-less Windows child cannot be sent Ctrl+C at all.
+        platform::interrupt_backend(pid)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
         let _ = pid;
         false
     }
@@ -558,11 +551,7 @@ where
     if let Some(directory) = config.backend.program.parent() {
         command.current_dir(directory);
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
-    }
+    platform::configure_backend(&mut command);
 
     // Linux: the kernel kills the backend when the guardian dies, even if the
     // guardian is SIGKILLed and never runs another line of its own code.
@@ -751,6 +740,10 @@ pub const UNRECLAIMED_BACKEND_MESSAGE: &str = "录播后端可能仍在运行：
      或在应用日志中查看详情。";
 
 fn report_fatal(app: &tauri::AppHandle, message: &str) {
+    if artifact_probe::enabled() {
+        artifact_probe::record("fatal-error");
+        eprintln!("artifact fatal error: {message}");
+    }
     app.dialog()
         .message(message)
         .title("BililiveRecorder")
@@ -862,6 +855,9 @@ fn stop_backend(app: &tauri::AppHandle) {
     } else {
         "guardian-wait-unsettled"
     });
+    if exit == Some(0) {
+        artifact_probe::record("guardian-exit-success");
+    }
     artifact_probe::record("stop-backend-returned");
 
     // Nothing to converge, and the guardian is still there: on this platform
@@ -1354,6 +1350,35 @@ mod monitor_tests {
             self.calls.push("wait");
             Err(io::Error::other("injected blocking wait failure"))
         }
+    }
+
+    #[test]
+    fn graceful_shutdown_exits_without_a_hard_kill() {
+        struct GracefulChild(Vec<&'static str>);
+        impl SupervisedChild for GracefulChild {
+            fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+                self.0.push("try_wait");
+                #[cfg(unix)]
+                use std::os::unix::process::ExitStatusExt;
+                #[cfg(windows)]
+                use std::os::windows::process::ExitStatusExt;
+                Ok(Some(ExitStatus::from_raw(0)))
+            }
+            fn interrupt(&mut self) -> bool {
+                self.0.push("interrupt");
+                true
+            }
+            fn kill(&mut self) -> io::Result<()> {
+                self.0.push("kill");
+                Ok(())
+            }
+            fn wait(&mut self) -> io::Result<ExitStatus> {
+                panic!("no blocking wait after graceful exit")
+            }
+        }
+        let mut child = GracefulChild(Vec::new());
+        shutdown_child(&mut child, Duration::ZERO);
+        assert_eq!(child.0, ["interrupt", "try_wait"]);
     }
 
     #[test]

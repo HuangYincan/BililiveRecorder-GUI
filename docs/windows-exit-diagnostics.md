@@ -90,3 +90,24 @@ gate, the first regression failed with request count 1 vs expected 0.
 Pins PID/event/complete-line matching and failure-stage classification. These
 local tests do not start an app, send a signal, or terminate any process. The
 real installed-app cases must run only in the existing disposable CI jobs.
+
+## Backend graceful shutdown after the GUI delivery fix
+
+Run `35860526134` reached the real CloseRequested callback, guardian wait,
+RunEvent::Exit and app process exit. Its remaining Windows failure was the
+CLI clean-shutdown log assertion: the console-less backend had no graceful
+interrupt route and fell straight to Child::kill.
+
+The next implementation allocates a hidden **guardian-owned** console before
+spawn, preserving all inherited standard handles. It starts the backend with
+CREATE_NEW_PROCESS_GROUP in that console and targets CTRL_BREAK_EVENT only at
+that group's owned root PID; group zero and existing-console attachment are
+not used. Upstream v2.20.0 `BililiveRecorder.Cli/Program.cs:326-335` registers
+Console.CancelKeyPress before host startup; the handler cancels the token, then
+its shutdown path stops the host and disposes the recorder. The existing
+bounded wait/escalation and Job Object abrupt-death fallback are retained.
+
+The test's clean-shutdown assertion is NOT removed. Normal Windows close also
+requires `guardian-exit-success`, separating graceful child exit from an
+accidentally terminated guardian. This does not add recording-file evidence;
+that remains a separate gap even if all these control-flow checks pass.

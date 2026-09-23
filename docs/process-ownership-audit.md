@@ -3,7 +3,7 @@
 Scope: PR #3 production lifecycle (`src-tauri/src`), with test-driver sites
 listed separately below. No process enumeration or user-instance termination
 is part of this audit. Function names are the stable anchors; line numbers are
-for this revision. This is an ownership inventory, not cross-platform runtime
+historical; function names are authoritative after subsequent edits. This is an ownership inventory, not cross-platform runtime
 proof.
 
 ## Preconditions (not PID re-querying)
@@ -28,7 +28,7 @@ All `lib.rs` locations below are under `src-tauri/src/`.
 | Site | Operation and ownership premise / failure action |
 | --- | --- |
 | `lib.rs:367,375,379`, `SupervisedChild for Child` | Delegates `try_wait`, `kill`, `wait` to std. `interrupt` (:370) delegates to `send_interrupt`; these adapters establish no ownership themselves. The private interface is also used by the operation-counting spy. |
-| `lib.rs:315`, `send_interrupt` | Unix `kill(SIGINT)` of the supplied child ID; Windows returns false without a signal. Only caller is the adapter used by `shutdown_child`, with the preconditions below. |
+| `lib.rs:315`, `send_interrupt` | Unix `kill(SIGINT)` of the supplied child ID; Windows delegates to `platform::interrupt_backend`, scoped to the new backend control group in the guardian's private console. Only caller is the adapter used by `shutdown_child`, with the preconditions below. |
 | `lib.rs:389-402`, `wait_for_exit` → `wait_for_child_exit` | Polls owned child; `Some` → Exited/reaped, `Err` → Unwaitable immediately, `None` at deadline → TimedOut. No signal. Used by guardian shutdown twice and backend shutdown once. |
 | `lib.rs:436`, first guardian bounded wait | Own app-spawned guardian. Exited/Unwaitable return without escalation. macOS also returns on TimedOut; only containment-enabled platforms proceed. |
 | `lib.rs:459`, guardian SIGTERM | Unix containment-enabled path (Linux); first wait must return TimedOut. Sole-reaper assumption must still hold. No backend PID is queried or signalled. |
@@ -39,6 +39,31 @@ All `lib.rs` locations below are under `src-tauri/src/`.
 | `lib.rs:863`, `stop_backend` diagnostic poll | After unsuccessful guardian shutdown, macOS checks whether to warn. May reap an exited guardian; no result licenses a signal. No retry/escalation follows. |
 | `platform.rs:46-53`, Linux parent-death setup | In the new child's pre-exec callback, arms SIGKILL on death of the forking guardian thread; checks parent race and `_exit(1)` if already orphaned. No external PID receives a userspace signal. |
 | `platform.rs:113,119`, Job Object failure closes | Closes newly created job on setup/assignment failure, before any backend spawn. Success deliberately does not CloseHandle; raw handle has no Drop. Kernel closes it on guardian exit. Removed Copy-value `mem::forget`, which did not implement this lifetime. |
+
+### Windows graceful-control addition
+
+- `platform::private_console` runs before any backend spawn. `AllocConsole`
+  creates only the guardian's console; there is no AttachConsole or enumeration.
+  The new console is hidden using its own GetConsoleWindow handle. All three
+  inherited standard handles are saved/restored so the keepalive and event
+  pipes remain unchanged. Any setup error refuses the spawn.
+- `platform::configure_backend` sets CREATE_NEW_PROCESS_GROUP, not
+  CREATE_NO_WINDOW: the backend inherits that private console but starts its
+  own control group. The guardian is not in the backend's group.
+- `platform::interrupt_backend` uses GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT,
+  child.id()). The caller still owns an unreaped child created with the above
+  configuration. Group zero is explicitly rejected; no broadcast or PID query
+  is used. The control event addresses the backend's group (including any of
+  its same-console descendants that inherit the group), not arbitrary processes
+  attached to a user's console. Existing Exited/Unwaitable stop conditions and
+  timeout-only escalation after a successful interrupt remain unchanged.
+- The Job Object remains kill-on-close containment, not the normal shutdown
+  mechanism. The normal artifact case now also requires a zero-code guardian
+  exit, so accidentally terminating the guardian with a control event cannot
+  masquerade as a normal shutdown.
+- Opt-in artifact control uses only the parent's own child stdin to request
+  the Tauri main window's normal CloseRequested path; trace files do not issue
+  process signals. The production GUI/guardian wait decisions are unchanged.
 
 Additional lifecycle requests: `stop_backend` closes its own guardian stdin
 (:847), asking the guardian to stop via EOF, not a PID signal. The keepalive

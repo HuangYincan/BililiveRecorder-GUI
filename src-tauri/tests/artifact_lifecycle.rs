@@ -381,6 +381,15 @@ fn quitting_the_app_stops_the_backend() {
         stopped_serving,
         "the app exited but the backend was still serving"
     );
+    #[cfg(windows)]
+    assert!(
+        artifact_probe::contains(
+            &fs::read_to_string(&app.trace).unwrap_or_default(),
+            app.pid(),
+            "guardian-exit-success"
+        ),
+        "normal close must let the guardian exit successfully, not terminate it with the control event"
+    );
     if flushed == Some(false) {
         panic!(
             "the backend stopped serving but the CLI log shows no clean \
