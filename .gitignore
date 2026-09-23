@@ -17,3 +17,5 @@ src-tauri/sidecar/*
 bililive-recorder-webui-main.png
 bililive-recorder-webui-lifecycle.png
 .release-audit/
+.linux-cli-smoke/
+.linux-cli-smoke-workdir/

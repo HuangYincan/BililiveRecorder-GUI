@@ -13,6 +13,7 @@
 1. `upstream.json` 记录唯一的上游版本来源。
 2. `scripts/prepare-sidecar.mjs` 从 BililiveRecorder 官方 Release 下载与 Tauri target triple 对应的完整 CLI 压缩包；官方 WebUI 已嵌入该 CLI，因此不会发生手工搬运 UI。
 3. Tauri 将 CLI 的完整 .NET 自包含运行目录作为资源随桌面安装包分发。
+   Linux 打包仅移除 CoreCLR 的可选 LTTng tracing provider；该库在 Ubuntu 22.04 缺少其旧 ABI 依赖，且 .NET 运行时明确允许 provider 不存在。正式构建会先执行 CLI 版本检查，再生成 deb、rpm、AppImage 与签名更新包。
 4. 应用启动时自动创建系统视频目录下的 `BililiveRecorder` 工作目录，为后端分配随机本机端口并在后台执行：
 
    ```text

@@ -43,6 +43,9 @@ const archive = new AdmZip(archivePath);
 const executableName = `BililiveRecorder.Cli${extension}`;
 archive.extractAllTo(outputDirectory, true);
 if (!existsSync(output)) throw new Error(`${executableName} not found at archive root in ${asset}`);
+if (target.includes('linux')) {
+  rmSync(join(outputDirectory, 'libcoreclrtraceptprovider.so'), { force: true });
+}
 if (!extension) chmodSync(output, 0o755);
 rmSync(archivePath, { force: true });
 console.log(`Prepared ${output}`);
