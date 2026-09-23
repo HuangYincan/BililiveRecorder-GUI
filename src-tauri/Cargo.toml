@@ -1,6 +1,6 @@
 [package]
 name = "bililive-recorder-gui"
-version = "2.20.0"
+version = "2.20.1"
 description = "Cross-platform Tauri desktop launcher for BililiveRecorder"
 authors = ["HuangYincan"]
 license = "GPL-3.0-only"
