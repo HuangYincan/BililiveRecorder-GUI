@@ -1,12 +1,14 @@
 name: Release synced desktop app
 
+# No push trigger: a code-only merge must never rebuild or overwrite an old
+# signed release. Upstream sync dispatches the newly merged SHA explicitly.
 on:
-  push:
-    branches: [main]
-    paths:
-      - upstream.json
   workflow_dispatch:
     inputs:
+      approved_sha:
+        description: "Reviewed main commit to release (must match HEAD of main)"
+        required: true
+        type: string
       source_pr:
         description: "Upstream sync PR that requested this release"
         required: false
@@ -15,8 +17,58 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: desktop-release
+  cancel-in-progress: false
+
 jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Require approved main and a new immutable tag and updater version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPROVED_SHA: ${{ inputs.approved_sha }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Release must target main" >&2
+            exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "$APPROVED_SHA" != "$GITHUB_SHA" ]; then
+            echo "Approval SHA does not match main's checked-out commit" >&2
+            exit 1
+          fi
+          MAIN_SHA=$(git ls-remote --exit-code origin refs/heads/main | cut -f1)
+          if [ "$MAIN_SHA" != "$GITHUB_SHA" ]; then
+            echo "main advanced since this release was approved; review its new SHA" >&2
+            exit 1
+          fi
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="app-v${VERSION}"
+          # Do not silently overwrite the old release even if no release
+          # object is visible yet (a draft or a leftover tag is enough).
+          if [ -n "$(git ls-remote --tags origin "refs/tags/${TAG}")" ]; then
+            echo "Release tag ${TAG} already exists; bump the desktop version first" >&2
+            exit 1
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; refusing to overwrite assets" >&2
+            exit 1
+          fi
+          # This repository already has a published updater release; a failed
+          # lookup is an error, not permission to publish an unverified tag.
+          LATEST=$(gh release view --json tagName --jq '.tagName')
+          if [ -n "$LATEST" ]; then
+            CURRENT_VERSION="$VERSION" LATEST_VERSION="${LATEST#app-v}" node --input-type=module -e '
+              import { compareVersions } from "./scripts/desktop-version.mjs";
+              if (compareVersions(process.env.CURRENT_VERSION, process.env.LATEST_VERSION) <= 0)
+                throw new Error("Desktop version must be newer than the public latest release");
+            '
+          fi
+
   release:
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:
@@ -52,6 +104,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
       - run: npm ci
+      - name: Verify builder checkout is the approved commit
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
       - run: npm run sidecar:prepare
       - name: Verify Linux sidecar
         if: matrix.platform == 'ubuntu-22.04'
@@ -83,6 +138,10 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 24
+      - name: Test missing-tag creation and identity rejection without publishing
+        run: node --test scripts/ensure-release-tag.test.mjs
+      - name: Establish new tag and verify it resolves to the actual build commit
+        run: bash scripts/ensure-release-tag.sh
       - name: Validate updater assets and signatures
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
