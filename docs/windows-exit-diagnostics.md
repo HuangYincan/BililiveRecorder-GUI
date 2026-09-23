@@ -90,3 +90,38 @@ gate, the first regression failed with request count 1 vs expected 0.
 Pins PID/event/complete-line matching and failure-stage classification. These
 local tests do not start an app, send a signal, or terminate any process. The
 real installed-app cases must run only in the existing disposable CI jobs.
+
+## Backend graceful shutdown after the GUI delivery fix
+
+Run `35860526134` reached the real CloseRequested callback, guardian wait,
+RunEvent::Exit and app process exit. Its remaining Windows failure was the
+CLI clean-shutdown log assertion: the console-less backend had no graceful
+interrupt route and fell straight to Child::kill.
+
+The next implementation allocates a hidden **guardian-owned** console before
+spawn, preserving all inherited standard handles. It starts the backend with
+CREATE_NEW_PROCESS_GROUP in that console and targets CTRL_BREAK_EVENT only at
+that group's owned root PID; group zero and existing-console attachment are
+not used. Upstream v2.20.0 `BililiveRecorder.Cli/Program.cs:326-335` registers
+Console.CancelKeyPress before host startup; the handler cancels the token, then
+its shutdown path stops the host and disposes the recorder. The existing
+bounded wait/escalation and Job Object abrupt-death fallback are retained.
+
+The test's clean-shutdown assertion is NOT removed. Normal Windows close also
+requires `guardian-exit-success`, separating graceful child exit from an
+accidentally terminated guardian. This does not add recording-file evidence;
+that remains a separate gap even if all these control-flow checks pass.
+
+The Windows normal-close case additionally requires the guardian's actual
+`backend-graceful-exit` marker (bounded wait returned child exit code 0) and
+rejects ANY `backend-hard-kill` attempt in that run. GUI/guardian success and
+an early clean-shutdown log can no longer hide timeout escalation. This is
+stronger than the old log/port predicate and does not certify recording files.
+
+The first private-console run (`35865807259`) refused startup at AllocConsole
+with Windows error 5 while the guardian still used CREATE_NO_WINDOW. Hidden
+window creation and detached console creation are distinct. The guardian is
+now spawned with DETACHED_PROCESS and its existing explicit standard pipes;
+AllocConsole must then succeed before any backend starts. There is still no
+fallback that adopts an existing console. The backend, separately, uses only
+CREATE_NEW_PROCESS_GROUP so it inherits the newly allocated private console.
