@@ -28,7 +28,7 @@
 
 1. `.github/workflows/sync-upstream.yml` 每天查询 BililiveRecorder 最新官方 Release。
 2. 发现新版本后，自动更新 `upstream.json` 并**独立递增**桌面/updater 版本（同步 npm、Cargo、Tauri 及锁文件），校验各平台官方 CLI 资产，创建启用自动合并的同步 PR。上游版本只代表 CLI，桌面版本始终递增。
-3. 上游同步 PR 合并后，仅针对其合并 SHA dispatch 发布流程；单纯合并代码**不会**触发发布。桌面壳修复在独立 PR 中完成安全审查后，运行 `npm run desktop:bump` 递增桌面版本；合并后需明确授权，使用 `gh workflow run release.yml --ref main -f approved_sha=<已审查的main提交SHA>` 请求发布。预检 SHA、版本高于当前公开最新版以及新 tag 不存在；绝不覆盖旧发布。PR #3 的阻塞未解除前不发布其产物。
+3. 上游同步 PR 合并后，仅针对其合并 SHA dispatch 发布流程；单纯合并代码**不会**触发发布。桌面壳修复在独立 PR 中完成安全审查后，运行 `npm run desktop:bump` 递增桌面版本；合并后需明确授权，使用 `gh workflow run release.yml --ref main -f approved_sha=<已审查的main提交SHA>` 请求发布。预检 SHA、版本高于当前公开最新版以及新 tag 不存在；四平台构建核对 checkout SHA，草稿发布后再断言远端 tag（轻量/附注均剥离）指向本次构建 SHA，之后才聚合签名与发布；绝不覆盖旧发布。PR #3 的阻塞未解除前不发布其产物。
 4. 发布流程在 macOS ARM64、macOS x64、Windows x64、Linux x64 上重新下载对应官方 CLI 并构建桌面安装包。
 5. 发布流程使用 Tauri updater 私钥签名更新包；各平台构建完成后统一聚合并校验 GitHub Release 的 `latest.json`，避免矩阵任务互相覆盖更新清单。
 6. 已安装应用启动后通过系统原生对话框提示更新；验证签名后原位更新并重启，不引入自建更新页面。

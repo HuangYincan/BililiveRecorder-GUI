@@ -6,7 +6,7 @@
 
 - 旧 Sol 在议题 NVC-5 的交付报告称，Linux AppImage 已打包、发布与验签，macOS 低版本 `2.19.99` 安装副本更新到 `2.20.0`，并在之后 Quit。它是报告，并非本次代理执行的实验。
 - GitHub Actions [release run 35823885924](https://github.com/HuangYincan/BililiveRecorder-GUI/actions/runs/35823885924) 成功，**构建 head `5b1a148d11645d53b22b2083d3e7addc09a28221`**，从 05:47:38 运行至 05:56:41；公开 [app-v2.20.0](https://github.com/HuangYincan/BililiveRecorder-GUI/releases/tag/app-v2.20.0) 在 05:56:37 发布。release tag 当前指向较早的 `c0577ecf25db4d546a953694e4838ed959a486d6`，因此**不能仅以 tag 目标 SHA 代替该次 workflow 的构建 SHA**；须同时记录二者。PR #3 不在该次 run 中。
-- GitHub Release 资产 digest 与旧工作区已存在文件的只读 SHA-256 一致：ARM64 updater `.app.tar.gz` 为 `84d10bb2b568eb7a616763005f3182160aaff1d31c92ac04de39b7b253d69230`；公开 Linux AppImage 为 `49927eaa92108b9af0748c28c5369500833b8d20ab3cc40148765f862247df3e`。**旧 Sol 评论所写 Linux AppImage SHA `49927eaa92108b9af07442e8a0d5008c4fefc513228a87668b9d979ea43c91e6` 与现有本地文件/公开资产均不符，撤回其作为已核对摘要的准确性**，不能拿旧摘要代替文件校验。未重新下载或覆盖资产。
+- GitHub Release 资产 digest 与旧工作区已存在文件的只读 SHA-256 一致：ARM64 updater `.app.tar.gz` 为 `84d10bb2b568eb7a616763005f3182160aaff1d31c92ac04de39b7b253d69230`；公开 Linux AppImage 为 `49927eaa92108b9af0748c28c5369500833b8d20ab3cc40148765f862247df3e`。**旧 Sol 评论所写 Linux AppImage SHA `49927eaa92108b9af07442e8a0d5008c4fefc513228a87668b9d979ea43c91e6` 与现有本地文件/公开资产均不符**；该字符串甚至与不同资产（AppImage 前缀、RPM 尾缀）的摘要拼接一致，不能对应已确认的单个文件。因此旧报告声称的“独立 minisign 校验通过”**不能绑定到其所列 SHA，本次证据作废**，不能拿旧摘要替代新的签名核验。未重新下载或覆盖资产。
 - 旧工作区已保存四平台 `latest.json`（版本 `2.20.0`）；公开 Release 包含 ARM64 updater 与签名、Linux AppImage 与签名。以上证明公开资产与清单存在，不证明真实 Linux 图形安装/更新，也不证明 PR #3 安全修复。
 
 ## 更新与退出时间线；报告和可证实事项分开
