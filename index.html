@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#111827" />
+    <title>BililiveRecorder GUI</title>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div class="brand-mark" aria-hidden="true">录</div>
+        <div>
+          <p class="eyebrow">BililiveRecorder GUI</p>
+          <h1>跨平台录播姬桌面端</h1>
+          <p class="subtitle">管理官方 CLI 后端、工作目录和桌面窗口。</p>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="status-row">
+          <div>
+            <span class="label">后端状态</span>
+            <strong id="status" class="status">正在检查</strong>
+          </div>
+          <button id="refresh" class="quiet" type="button">刷新</button>
+        </div>
+
+        <label class="label" for="workdir">工作目录</label>
+        <div class="field-row">
+          <input id="workdir" type="text" placeholder="请选择配置和录制文件保存目录" />
+          <button id="choose" class="secondary" type="button">选择目录</button>
+        </div>
+
+        <div id="error" class="error" role="alert" hidden></div>
+
+        <div class="actions">
+          <button id="start" class="primary" type="button">启动并打开录播姬</button>
+          <button id="open" class="secondary" type="button">打开管理界面</button>
+          <button id="stop" class="danger" type="button">停止后端</button>
+        </div>
+      </section>
+
+      <section class="info-grid">
+        <article>
+          <span class="label">录制后端</span>
+          <strong>BililiveRecorder CLI <span id="backend-version">v2.20.0</span></strong>
+          <p>应用随安装包分发官方 CLI，并在退出时先请求优雅停止。</p>
+        </article>
+        <article>
+          <span class="label">本地访问</span>
+          <strong id="backend-url">尚未启动</strong>
+          <p>监听地址只绑定到 127.0.0.1，不向局域网或公网开放。</p>
+        </article>
+      </section>
+
+      <section id="update-panel" class="update-panel" hidden>
+        <div>
+          <span class="label">桌面更新</span>
+          <strong>发现 BililiveRecorder GUI <span id="update-version"></span></strong>
+          <p id="update-notes">该版本已自动同步最新官方 CLI 与内置 WebUI。</p>
+        </div>
+        <button id="install-update" class="primary" type="button">下载并安装</button>
+      </section>
+
+      <details class="logs">
+        <summary>后端日志</summary>
+        <pre id="log-output">暂无日志</pre>
+      </details>
+
+      <footer>
+        本项目与随附的 BililiveRecorder 后端均按 GPL-3.0-only 分发。
+      </footer>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

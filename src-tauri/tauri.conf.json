@@ -1,0 +1,51 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "BililiveRecorder GUI",
+  "version": "2.20.0",
+  "identifier": "org.danmuji.bililiverecorder-gui",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "BililiveRecorder GUI",
+        "width": 900,
+        "height": 760,
+        "minWidth": 640,
+        "minHeight": 620,
+        "resizable": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": true,
+    "resources": ["sidecar/**/*"],
+    "license": "GPL-3.0-only",
+    "shortDescription": "跨平台录播姬桌面端",
+    "longDescription": "基于 Tauri 的 BililiveRecorder 跨平台桌面端，负责官方 CLI 后端分发、启动、停止与工作目录管理。",
+    "category": "Utility",
+    "copyright": "Copyright © 2026 HuangYincan",
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI4M0ZEOUJBMzREMEJENUQKUldSZHZkQTB1dGsvS0NBeHNBakp0RUg5aDJjeHBDVG1mL2o1NnYraDZQSDA1M2ZkMVRYNDI2djQK",
+      "endpoints": [
+        "https://github.com/huangyincan/BililiveRecorder-GUI/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "name": "bililive-recorder-gui",
+  "private": true,
+  "version": "2.20.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "tauri": "tauri",
+    "sidecar:prepare": "node scripts/prepare-sidecar.mjs",
+    "upstream:sync": "node scripts/sync-upstream.mjs",
+    "desktop:dev": "npm run sidecar:prepare && tauri dev",
+    "desktop:build": "npm run sidecar:prepare && tauri build",
+    "check": "npm run build && cargo check --manifest-path src-tauri/Cargo.toml"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.11.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.5",
+    "adm-zip": "0.6.1",
+    "typescript": "7.0.2",
+    "vite": "8.3.0"
+  }
+}

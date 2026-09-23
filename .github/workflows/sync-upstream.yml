@@ -1,0 +1,36 @@
+name: Sync upstream BililiveRecorder
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run upstream:sync
+      - run: npm install --package-lock-only --ignore-scripts
+      - uses: peter-evans/create-pull-request@v7
+        with:
+          branch: automation/sync-bililive-recorder
+          delete-branch: true
+          commit-message: "chore: sync latest BililiveRecorder release"
+          title: "chore: sync latest BililiveRecorder release"
+          body: |
+            Automated upstream sync.
+
+            - Updates `upstream.json`
+            - Aligns desktop/updater version with the upstream release
+            - Build jobs fetch the official CLI assets, which already contain the matching official WebUI
+          labels: upstream-sync

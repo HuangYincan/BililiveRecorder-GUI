@@ -1,0 +1,26 @@
+[package]
+name = "bililive-recorder-gui"
+version = "2.20.0"
+description = "Cross-platform Tauri desktop launcher for BililiveRecorder"
+authors = ["HuangYincan"]
+license = "GPL-3.0-only"
+repository = "https://github.com/huangyincan/BililiveRecorder-GUI"
+edition = "2024"
+
+[lib]
+name = "bililive_recorder_gui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5.6", features = [] }
+
+[dependencies]
+libc = "0.2"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2.11.1", features = [] }
+tauri-plugin-dialog = "2.4.0"
+tauri-plugin-updater = "2.9.0"
+tokio = { version = "1", features = ["time"] }
+url = "2"
