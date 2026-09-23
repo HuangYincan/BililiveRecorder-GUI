@@ -14,6 +14,8 @@ jobs:
         include:
           - platform: macos-26
             target: aarch64-apple-darwin
+          - platform: macos-26-intel
+            target: x86_64-apple-darwin
           - platform: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
           - platform: windows-latest
@@ -39,7 +41,7 @@ jobs:
         if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xauth xvfb
       - run: npm ci
       - name: Test package verifier against cross-platform fixtures
         run: node --test scripts/verify-packaged-sidecar.test.mjs
@@ -57,3 +59,124 @@ jobs:
       - name: Smoke-test CLI executable extracted from the built desktop package
         timeout-minutes: 12
         run: npm run bundle:smoke
+      - name: Install DMG and verify artifact lifecycle
+        if: startsWith(matrix.platform, 'macos-26')
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg=$(find "src-tauri/target/${{ matrix.target }}/release/bundle/dmg" -name '*.dmg' -print -quit)
+          test -n "$dmg"
+          mountpoint="$RUNNER_TEMP/bililive-recorder-dmg"
+          installed_app="$RUNNER_TEMP/BililiveRecorder GUI.app"
+          mkdir -p "$mountpoint"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mountpoint" "$dmg"
+          trap 'hdiutil detach "$mountpoint" || true' EXIT
+          ditto "$mountpoint/BililiveRecorder GUI.app" "$installed_app"
+          hdiutil detach "$mountpoint"
+          trap - EXIT
+
+          export BILILIVE_ARTIFACT_APP="$installed_app/Contents/MacOS/bililive-recorder-gui"
+          export BILILIVE_ARTIFACT_OK=1
+          # Upstream Serilog uses RollingInterval.Day: it inserts YYYYMMDD
+          # before .txt; the unrolled configured base path never exists.
+          export BILILIVE_ARTIFACT_CLI_LOG="$HOME/Library/Logs/org.danmuji.bililiverecorder-gui/bililive-recorder$(date +%Y%m%d).txt"
+          export BILILIVE_ARTIFACT_EVIDENCE_DIR="$RUNNER_TEMP/artifact-lifecycle-evidence"
+          mkdir -p "$BILILIVE_ARTIFACT_EVIDENCE_DIR" "$(dirname "$BILILIVE_ARTIFACT_CLI_LOG")"
+          printf 'BILILIVE_ARTIFACT_EVIDENCE_DIR=%s\n' "$BILILIVE_ARTIFACT_EVIDENCE_DIR" >> "$GITHUB_ENV"
+
+          rm -f "$BILILIVE_ARTIFACT_CLI_LOG"
+          cargo test --manifest-path src-tauri/Cargo.toml --test artifact_lifecycle quitting_the_app_stops_the_backend -- --ignored --exact --nocapture 2>&1 | tee "$BILILIVE_ARTIFACT_EVIDENCE_DIR/quit-test.log"
+          test -s "$BILILIVE_ARTIFACT_CLI_LOG"
+          grep -Eq 'Shutdown in progress|Dispose called' "$BILILIVE_ARTIFACT_CLI_LOG"
+          cp "$BILILIVE_ARTIFACT_CLI_LOG" "$BILILIVE_ARTIFACT_EVIDENCE_DIR/quit-cli.log"
+
+          rm -f "$BILILIVE_ARTIFACT_CLI_LOG"
+          cargo test --manifest-path src-tauri/Cargo.toml --test artifact_lifecycle killing_the_app_stops_the_backend -- --ignored --exact --nocapture 2>&1 | tee "$BILILIVE_ARTIFACT_EVIDENCE_DIR/kill-test.log"
+          test -s "$BILILIVE_ARTIFACT_CLI_LOG"
+          cp "$BILILIVE_ARTIFACT_CLI_LOG" "$BILILIVE_ARTIFACT_EVIDENCE_DIR/kill-cli.log"
+      - name: Install DEB and verify artifact lifecycle
+        if: matrix.platform == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          set -euo pipefail
+          deb=$(find "src-tauri/target/${{ matrix.target }}/release/bundle/deb" -name '*_amd64.deb' ! -name '*.sig' -print -quit)
+          test -n "$deb"
+          sudo dpkg -i "$deb"
+          trap 'sudo dpkg -r bililive-recorder-gui || true' EXIT
+
+          export XDG_DATA_HOME="$RUNNER_TEMP/xdg-data"
+          export BILILIVE_ARTIFACT_APP=/usr/bin/bililive-recorder-gui
+          export BILILIVE_ARTIFACT_OK=1
+          # Upstream Serilog uses RollingInterval.Day: it inserts YYYYMMDD
+          # before .txt; the unrolled configured base path never exists.
+          export BILILIVE_ARTIFACT_CLI_LOG="$XDG_DATA_HOME/org.danmuji.bililiverecorder-gui/logs/bililive-recorder$(date +%Y%m%d).txt"
+          export BILILIVE_ARTIFACT_EVIDENCE_DIR="$RUNNER_TEMP/artifact-lifecycle-evidence"
+          mkdir -p "$BILILIVE_ARTIFACT_EVIDENCE_DIR" "$(dirname "$BILILIVE_ARTIFACT_CLI_LOG")"
+          printf 'BILILIVE_ARTIFACT_EVIDENCE_DIR=%s\n' "$BILILIVE_ARTIFACT_EVIDENCE_DIR" >> "$GITHUB_ENV"
+
+          test -x "$BILILIVE_ARTIFACT_APP"
+          rm -f "$BILILIVE_ARTIFACT_CLI_LOG"
+          xvfb-run -a cargo test --manifest-path src-tauri/Cargo.toml --test artifact_lifecycle quitting_the_app_stops_the_backend -- --ignored --exact --nocapture 2>&1 | tee "$BILILIVE_ARTIFACT_EVIDENCE_DIR/quit-test.log"
+          test -s "$BILILIVE_ARTIFACT_CLI_LOG"
+          grep -Eq 'Shutdown in progress|Dispose called' "$BILILIVE_ARTIFACT_CLI_LOG"
+          cp "$BILILIVE_ARTIFACT_CLI_LOG" "$BILILIVE_ARTIFACT_EVIDENCE_DIR/quit-cli.log"
+
+          rm -f "$BILILIVE_ARTIFACT_CLI_LOG"
+          xvfb-run -a cargo test --manifest-path src-tauri/Cargo.toml --test artifact_lifecycle killing_the_app_stops_the_backend -- --ignored --exact --nocapture 2>&1 | tee "$BILILIVE_ARTIFACT_EVIDENCE_DIR/kill-test.log"
+          test -s "$BILILIVE_ARTIFACT_CLI_LOG"
+          cp "$BILILIVE_ARTIFACT_CLI_LOG" "$BILILIVE_ARTIFACT_EVIDENCE_DIR/kill-cli.log"
+      - name: Install MSI and verify artifact lifecycle
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = Get-ChildItem "src-tauri/target/${{ matrix.target }}/release/bundle/msi" -Filter '*.msi' | Select-Object -First 1
+          if (-not $msi) { throw 'MSI bundle not found' }
+
+          $installDir = Join-Path $env:RUNNER_TEMP 'BililiveRecorder-GUI-installed'
+          $evidenceDir = Join-Path $env:RUNNER_TEMP 'artifact-lifecycle-evidence'
+          New-Item -ItemType Directory -Force -Path $evidenceDir | Out-Null
+          & msiexec.exe /i $msi.FullName /qn /norestart "INSTALLDIR=$installDir" "/L*v" (Join-Path $evidenceDir 'msi-install.log')
+          if ($LASTEXITCODE -ne 0) { throw "MSI install failed: $LASTEXITCODE" }
+
+          try {
+            $app = Get-ChildItem $installDir -Recurse -File -Filter 'bililive-recorder-gui.exe' | Select-Object -First 1
+            if (-not $app) { throw "Installed app not found under $installDir" }
+
+            $env:BILILIVE_ARTIFACT_APP = $app.FullName
+            $env:BILILIVE_ARTIFACT_OK = '1'
+            # Upstream Serilog inserts YYYYMMDD before .txt (daily rolling).
+            $env:BILILIVE_ARTIFACT_CLI_LOG = Join-Path $env:LOCALAPPDATA ('org.danmuji.bililiverecorder-gui/logs/bililive-recorder{0}.txt' -f (Get-Date -Format yyyyMMdd))
+            $env:BILILIVE_ARTIFACT_EVIDENCE_DIR = $evidenceDir
+            New-Item -ItemType Directory -Force -Path $env:BILILIVE_ARTIFACT_EVIDENCE_DIR | Out-Null
+            New-Item -ItemType Directory -Force -Path (Split-Path $env:BILILIVE_ARTIFACT_CLI_LOG) | Out-Null
+            "BILILIVE_ARTIFACT_EVIDENCE_DIR=$env:BILILIVE_ARTIFACT_EVIDENCE_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+            Remove-Item $env:BILILIVE_ARTIFACT_CLI_LOG -Force -ErrorAction SilentlyContinue
+            cargo test --manifest-path src-tauri/Cargo.toml --test artifact_lifecycle quitting_the_app_stops_the_backend -- --ignored --exact --nocapture 2>&1 | Tee-Object -FilePath (Join-Path $env:BILILIVE_ARTIFACT_EVIDENCE_DIR 'quit-test.log')
+            if ($LASTEXITCODE -ne 0) { throw "Artifact lifecycle test failed: $LASTEXITCODE" }
+            if (Test-Path $env:BILILIVE_ARTIFACT_CLI_LOG -PathType Leaf) {
+              Copy-Item $env:BILILIVE_ARTIFACT_CLI_LOG (Join-Path $env:BILILIVE_ARTIFACT_EVIDENCE_DIR 'quit-cli.log')
+            } else {
+              'UNPROVEN: Windows has no graceful console-control shutdown path, so a flushed CLI log is not required.' | Out-File (Join-Path $env:BILILIVE_ARTIFACT_EVIDENCE_DIR 'quit-flush-unproven.txt')
+            }
+
+            Remove-Item $env:BILILIVE_ARTIFACT_CLI_LOG -Force -ErrorAction SilentlyContinue
+            cargo test --manifest-path src-tauri/Cargo.toml --test artifact_lifecycle killing_the_app_stops_the_backend -- --ignored --exact --nocapture 2>&1 | Tee-Object -FilePath (Join-Path $env:BILILIVE_ARTIFACT_EVIDENCE_DIR 'kill-test.log')
+            if ($LASTEXITCODE -ne 0) { throw "Artifact lifecycle test failed: $LASTEXITCODE" }
+            if (Test-Path $env:BILILIVE_ARTIFACT_CLI_LOG -PathType Leaf) {
+              Copy-Item $env:BILILIVE_ARTIFACT_CLI_LOG (Join-Path $env:BILILIVE_ARTIFACT_EVIDENCE_DIR 'kill-cli.log')
+            } else {
+              'UNPROVEN: forced termination does not promise recording flush.' | Out-File (Join-Path $env:BILILIVE_ARTIFACT_EVIDENCE_DIR 'kill-flush-unproven.txt')
+            }
+          }
+          finally {
+            & msiexec.exe /x $msi.FullName /qn /norestart
+          }
+      - name: Upload artifact lifecycle evidence
+        if: always() && env.BILILIVE_ARTIFACT_EVIDENCE_DIR != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifact-lifecycle-${{ matrix.target }}
+          path: ${{ env.BILILIVE_ARTIFACT_EVIDENCE_DIR }}
+          if-no-files-found: warn

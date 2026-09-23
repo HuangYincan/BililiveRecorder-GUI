@@ -24,3 +24,13 @@ tauri-plugin-dialog = "2.4.0"
 tauri-plugin-updater = "2.9.0"
 tokio = { version = "1", features = ["time"] }
 url = "2"
+
+# The backend is tied to the guardian's lifetime by a job object, so that a
+# guardian killed outright still takes the backend with it.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+] }
