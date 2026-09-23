@@ -117,3 +117,11 @@ The Windows normal-close case additionally requires the guardian's actual
 rejects ANY `backend-hard-kill` attempt in that run. GUI/guardian success and
 an early clean-shutdown log can no longer hide timeout escalation. This is
 stronger than the old log/port predicate and does not certify recording files.
+
+The first private-console run (`35865807259`) refused startup at AllocConsole
+with Windows error 5 while the guardian still used CREATE_NO_WINDOW. Hidden
+window creation and detached console creation are distinct. The guardian is
+now spawned with DETACHED_PROCESS and its existing explicit standard pipes;
+AllocConsole must then succeed before any backend starts. There is still no
+fallback that adopts an existing console. The backend, separately, uses only
+CREATE_NEW_PROCESS_GROUP so it inherits the newly allocated private console.

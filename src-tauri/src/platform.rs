@@ -61,6 +61,20 @@ pub fn arm_parent_death(command: &mut Command) {
     }
 }
 
+/// CREATE_NO_WINDOW is not the same as having no console association. Start
+/// detached so the guardian can positively create its OWN console with
+/// AllocConsole; do not recover by attaching to/reusing an inherited console.
+pub fn configure_guardian(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::DETACHED_PROCESS;
+        command.creation_flags(DETACHED_PROCESS);
+    }
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
 /// Use the private guardian console, but give the backend its own control
 /// group. CREATE_NO_WINDOW must not be combined with this: a console-less CLI
 /// cannot receive the CTRL_BREAK_EVENT which its CancelKeyPress handler needs.
@@ -98,8 +112,8 @@ pub fn interrupt_backend(pid: u32) -> bool {
 fn private_console() -> Result<(), String> {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::Console::{
-        AllocConsole, GetConsoleWindow, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
-        STD_OUTPUT_HANDLE, SetStdHandle,
+        AllocConsole, GetConsoleCP, GetConsoleWindow, GetStdHandle, STD_ERROR_HANDLE,
+        STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{SW_HIDE, ShowWindow};
     unsafe {
@@ -115,8 +129,9 @@ fn private_console() -> Result<(), String> {
         }
         if AllocConsole() == 0 {
             return Err(format!(
-                "AllocConsole failed; refusing to reuse an existing console: {}",
-                std::io::Error::last_os_error()
+                "AllocConsole failed; refusing to reuse an existing console: {}; console code page={}",
+                std::io::Error::last_os_error(),
+                GetConsoleCP()
             ));
         }
         let window = GetConsoleWindow();

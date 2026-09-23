@@ -723,11 +723,7 @@ fn spawn_guardian(config: &GuardianConfig) -> Result<Child, String> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
-    }
+    platform::configure_guardian(&mut command);
     command.spawn().map_err(|error| error.to_string())
 }
 
