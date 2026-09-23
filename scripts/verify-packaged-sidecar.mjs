@@ -1,6 +1,6 @@
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve, basename } from 'node:path';
+import { join, resolve, basename, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
@@ -45,32 +45,35 @@ function onlyPackage(dir, suffix) {
   return packages[0];
 }
 
-export function verify(target = process.env.TAURI_TARGET_TRIPLE) {
+export function verify(target = process.env.TAURI_TARGET_TRIPLE, { projectRoot = root, runCommand = run } = {}) {
   if (!target) throw new Error('TAURI_TARGET_TRIPLE is required');
-  const bundle = resolve(root, 'src-tauri', 'target', target, 'release', 'bundle');
-  const version = JSON.parse(readFileSync(join(root, 'upstream.json'), 'utf8')).version.replace(/^v/, '');
+  const bundle = resolve(projectRoot, 'src-tauri', 'target', target, 'release', 'bundle');
+  const version = JSON.parse(readFileSync(join(projectRoot, 'upstream.json'), 'utf8')).version.replace(/^v/, '');
   // Only the CLI's semantic version is checked. This does NOT verify WebUI,
   // GUI startup, updater, process termination, or recording integrity.
   const temp = mkdtempSync(join(tmpdir(), 'bililive-package-smoke-'));
   try {
     let unpacked;
     if (target.includes('apple-darwin')) {
-      unpacked = join(bundle, 'macos');
-      onlyPackage(unpacked, '.app/Contents/Info.plist');
+      const plist = onlyPackage(join(bundle, 'macos'), '.app/Contents/Info.plist');
+      unpacked = dirname(dirname(plist)); // the single .app, never its siblings
     } else if (target.includes('linux')) {
       const deb = onlyPackage(join(bundle, 'deb'), '.deb');
       unpacked = join(temp, 'deb');
-      run('dpkg-deb', ['--extract', deb, unpacked]);
+      runCommand('dpkg-deb', ['--extract', deb, unpacked]);
     } else if (target.includes('windows')) {
       const msi = onlyPackage(join(bundle, 'msi'), '.msi');
       unpacked = join(temp, 'msi');
-      run('msiexec.exe', ['/a', msi, '/qn', `TARGETDIR=${unpacked}`, '/L*v', join(temp, 'msiexec.log')]);
+      runCommand('msiexec.exe', ['/a', msi, '/qn', `TARGETDIR=${unpacked}`, '/L*v', join(temp, 'msiexec.log')]);
     } else {
       throw new Error(`Unsupported target ${target}`);
     }
     const cli = locateBundledCli(unpacked, target);
-    const actual = run(cli, ['--version'], 60_000).trim();
-    if (!actual.includes(version)) throw new Error(`Bundled CLI version mismatch: expected ${version}, got ${actual}`);
+    const actual = runCommand(cli, ['--version'], 60_000).trim();
+    // The official CLI prints e.g. 2.20.0+Branch.tags-v2.20.0.Sha.<hash>.
+    // Ignore only SemVer build metadata; the whole X.Y.Z core must match.
+    const parsed = /^(\d+\.\d+\.\d+)(?:\+[0-9A-Za-z.-]+)?$/.exec(actual);
+    if (!parsed || parsed[1] !== version) throw new Error(`Bundled CLI version mismatch: expected ${version}, got ${actual}`);
     console.log(`Packaged CLI executable smoke succeeded: ${target}, CLI ${actual}`);
   } finally {
     rmSync(temp, { recursive: true, force: true });
