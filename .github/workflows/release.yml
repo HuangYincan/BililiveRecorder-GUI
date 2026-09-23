@@ -104,6 +104,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
       - run: npm ci
+      - name: Verify builder checkout is the approved commit
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
       - run: npm run sidecar:prepare
       - name: Verify Linux sidecar
         if: matrix.platform == 'ubuntu-22.04'
@@ -135,6 +138,22 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 24
+      - name: Verify new release tag resolves to the actual build commit
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="app-v${VERSION}"
+          # FETCH_HEAD^{commit} peels both lightweight and annotated tags.
+          # The matrix created the draft release; before publishing anything,
+          # assert its remote tag points at the precise checkout used to build.
+          git fetch --no-tags origin "refs/tags/${TAG}"
+          TAG_SHA=$(git rev-parse 'FETCH_HEAD^{commit}')
+          BUILT_SHA=$(git rev-parse HEAD)
+          if [ "$TAG_SHA" != "$BUILT_SHA" ] || [ "$BUILT_SHA" != "$GITHUB_SHA" ]; then
+            echo "Refusing to publish ${TAG}: tag=${TAG_SHA}, checkout=${BUILT_SHA}, run=${GITHUB_SHA}" >&2
+            exit 1
+          fi
+          echo "Verified ${TAG} => ${BUILT_SHA}"
       - name: Validate updater assets and signatures
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
