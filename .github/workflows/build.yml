@@ -14,6 +14,8 @@ jobs:
         include:
           - platform: macos-26
             target: aarch64-apple-darwin
+          - platform: macos-26-intel
+            target: x86_64-apple-darwin
           - platform: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
           - platform: windows-latest
@@ -53,7 +55,7 @@ jobs:
         with:
           args: -vv --target ${{ matrix.target }} --config '{"bundle":{"createUpdaterArtifacts":false}}'
       - name: Install DMG and verify artifact lifecycle
-        if: matrix.platform == 'macos-26'
+        if: startsWith(matrix.platform, 'macos-26')
         shell: bash
         run: |
           set -euo pipefail
