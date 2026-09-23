@@ -120,9 +120,9 @@ pub fn contain_guardian() -> Result<(), String> {
                 return Err(format!("AssignProcessToJobObject 失败：{error}"));
             }
 
-            // Intentionally leaked: the kernel must close this handle, because
-            // doing so is what takes the backend down.
-            std::mem::forget(job);
+            // Intentionally do not CloseHandle on success. This raw handle has
+            // no Drop; the kernel closes it when the guardian exits, taking the
+            // job down. mem::forget on this Copy value would do nothing.
         }
         Ok(())
     }

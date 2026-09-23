@@ -150,7 +150,7 @@ use std::{
     io::{self, BufRead, BufReader, Read, Write},
     net::TcpListener,
     path::PathBuf,
-    process::{Child, ChildStdout, Command, Stdio},
+    process::{Child, ChildStdout, Command, ExitStatus, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
@@ -353,6 +353,33 @@ impl WaitOutcome {
     }
 }
 
+// Private process-operation seam: the production monitor and shutdown path use
+// the same operations as the spy tests. No test needs a real PID or signal.
+trait SupervisedChild {
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>>;
+    fn interrupt(&mut self) -> bool;
+    fn kill(&mut self) -> io::Result<()>;
+    fn wait(&mut self) -> io::Result<ExitStatus>;
+}
+
+impl SupervisedChild for Child {
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        Child::try_wait(self)
+    }
+
+    fn interrupt(&mut self) -> bool {
+        send_interrupt(self.id())
+    }
+
+    fn kill(&mut self) -> io::Result<()> {
+        Child::kill(self)
+    }
+
+    fn wait(&mut self) -> io::Result<ExitStatus> {
+        Child::wait(self)
+    }
+}
+
 /// Polls `child` until it exits or `within` elapses, keeping the three outcomes
 /// distinct.
 ///
@@ -360,6 +387,10 @@ impl WaitOutcome {
 /// one result that must never be read as "still running", and a timeout that
 /// had already been reached is not a reason to reinterpret a failed wait.
 pub fn wait_for_exit(child: &mut Child, within: Duration) -> WaitOutcome {
+    wait_for_child_exit(child, within)
+}
+
+fn wait_for_child_exit(child: &mut impl SupervisedChild, within: Duration) -> WaitOutcome {
     let deadline = Instant::now() + within;
     loop {
         match child.try_wait() {
@@ -445,12 +476,13 @@ pub fn shutdown_guardian(guardian: &mut Child, patience: Duration) -> Option<i32
 }
 
 /// Walks the guardian's own child through the two-stage shutdown.
-fn shutdown_child(child: &mut Child, graceful_timeout: Duration) {
-    // No wait has happened yet, so this child is still unreaped and its pid is
-    // unambiguously ours — including on the platforms where `send_interrupt`
-    // declines and we fall straight through to `kill`.
-    if send_interrupt(child.id()) {
-        match wait_for_exit(child, graceful_timeout) {
+fn shutdown_child(child: &mut impl SupervisedChild, graceful_timeout: Duration) {
+    // The monitor calls this only before a terminal wait result: either just
+    // after spawn or after Ok(None), never after Exited/Err. This relies on the
+    // guardian being the sole reaper (no external waitpid/auto-reaping). That
+    // ownership also covers platforms where interrupt declines and we kill.
+    if child.interrupt() {
+        match wait_for_child_exit(child, graceful_timeout) {
             // Reaped: the pid is free, and nothing below may signal it again.
             WaitOutcome::Exited(_) => return,
             // The wait failed, so ownership of this pid is no longer
@@ -475,9 +507,10 @@ fn write_event<W: Write>(events: &mut W, line: &str) {
 
 /// Owns `config.backend` for as long as this process lives.
 ///
-/// Returns after the backend has been reaped, having written exactly one line
-/// to `events`: [`EVENT_STOPPED`], [`EVENT_EXITED`] or an [`EVENT_ERROR_PREFIX`]
-/// message. `keepalive` reaching end of file means the app is gone.
+/// Writes a startup diagnostic followed by a terminal event to `events`:
+/// [`EVENT_STOPPED`], [`EVENT_EXITED`] or an [`EVENT_ERROR_PREFIX`] message.
+/// A monitoring error returns without signalling or reaping the backend, whose
+/// ownership is then unknown. `keepalive` EOF means the app is gone.
 pub fn supervise<R, W>(config: &GuardianConfig, keepalive: R, events: W) -> i32
 where
     R: Read + Send + 'static,
@@ -569,25 +602,38 @@ where
         });
     }
 
+    monitor_child(&mut child, &app_gone, &mut events, config.graceful_timeout)
+}
+
+// This is the actual post-spawn monitor, not a model of its decisions. Keeping
+// the process operations injectable lets tests count every termination attempt
+// even when try_wait fails and no real process can safely be signalled.
+fn monitor_child(
+    child: &mut impl SupervisedChild,
+    app_gone: &AtomicBool,
+    events: &mut impl Write,
+    graceful_timeout: Duration,
+) -> i32 {
     loop {
         if app_gone.load(Ordering::SeqCst) {
-            shutdown_child(&mut child, config.graceful_timeout);
-            write_event(&mut events, EVENT_STOPPED);
+            shutdown_child(child, graceful_timeout);
+            write_event(events, EVENT_STOPPED);
             return 0;
         }
         match child.try_wait() {
             Ok(Some(_)) => {
-                write_event(&mut events, EVENT_EXITED);
+                write_event(events, EVENT_EXITED);
                 return 0;
             }
             Ok(None) => {}
             Err(error) => {
                 write_event(
-                    &mut events,
+                    events,
                     &format!("{EVENT_ERROR_PREFIX}无法监视录播后端：{error}"),
                 );
-                let _ = child.kill();
-                let _ = child.wait();
+                // A failed wait does not establish ownership. In particular,
+                // an external reaper may have released the PID already. Do not
+                // kill, wait again, or enter the EOF shutdown path after this.
                 return 1;
             }
         }
@@ -1213,5 +1259,100 @@ mod tests {
             .join(" ");
         assert!(!rendered.contains("--pid"));
         assert!(!rendered.to_lowercase().contains("pid"));
+    }
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::*;
+
+    struct SpyChild<'a> {
+        running_polls: usize,
+        eof_on_error: Option<&'a AtomicBool>,
+        calls: Vec<&'static str>,
+    }
+
+    impl SupervisedChild for SpyChild<'_> {
+        fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+            self.calls.push("try_wait");
+            if self.running_polls > 0 {
+                self.running_polls -= 1;
+                return Ok(None);
+            }
+            if let Some(app_gone) = self.eof_on_error {
+                app_gone.store(true, Ordering::SeqCst);
+            }
+            Err(io::Error::other("injected monitor wait failure"))
+        }
+
+        fn interrupt(&mut self) -> bool {
+            self.calls.push("interrupt");
+            false
+        }
+
+        fn kill(&mut self) -> io::Result<()> {
+            self.calls.push("kill");
+            Ok(())
+        }
+
+        fn wait(&mut self) -> io::Result<ExitStatus> {
+            self.calls.push("wait");
+            Err(io::Error::other("injected blocking wait failure"))
+        }
+    }
+
+    #[test]
+    fn monitor_wait_failure_never_terminates() {
+        // Failure at startup, after a successful running poll, and coincident
+        // with keepalive EOF must all exit through the real monitor Err arm.
+        for (running_polls, eof_on_error) in [(0, false), (1, false), (0, true)] {
+            let app_gone = AtomicBool::new(false);
+            let mut child = SpyChild {
+                running_polls,
+                eof_on_error: eof_on_error.then_some(&app_gone),
+                calls: Vec::new(),
+            };
+            let mut events = Vec::new();
+            let code = monitor_child(&mut child, &app_gone, &mut events, Duration::ZERO);
+            let termination_calls = child
+                .calls
+                .iter()
+                .filter(|&&call| call == "interrupt" || call == "kill")
+                .count();
+            assert_eq!(termination_calls, 0, "calls: {:?}", child.calls);
+            assert_eq!(child.calls, vec!["try_wait"; running_polls + 1]);
+            assert_eq!(code, 1);
+            let events = String::from_utf8(events).unwrap();
+            assert!(events.starts_with(EVENT_ERROR_PREFIX));
+            assert!(events.contains("injected monitor wait failure"));
+            assert_eq!(events.lines().count(), 1);
+            assert!(!events.contains(EVENT_STOPPED));
+        }
+    }
+
+    #[test]
+    fn monitor_eof_exercises_the_same_termination_spy() {
+        // Positive control: this spy observes real shutdown operations, not
+        // only wait classification. No OS process is created or signalled.
+        let mut child = SpyChild {
+            running_polls: 0,
+            eof_on_error: None,
+            calls: Vec::new(),
+        };
+        let mut events = Vec::new();
+        assert_eq!(
+            monitor_child(
+                &mut child,
+                &AtomicBool::new(true),
+                &mut events,
+                Duration::ZERO
+            ),
+            0
+        );
+        assert_eq!(child.calls, ["interrupt", "kill", "wait"]);
+        assert_eq!(
+            String::from_utf8(events).unwrap(),
+            format!("{EVENT_STOPPED}\n")
+        );
     }
 }
