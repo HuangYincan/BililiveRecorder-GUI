@@ -1128,6 +1128,7 @@ mod tests {
     /// `trap` would die looking exactly like one ended by the escalation. The
     /// test below has to tell those apart, so it waits for the child to say it
     /// is ready.
+    #[cfg(unix)]
     fn stubborn_child(ready: &std::path::Path) -> Child {
         // The path is quoted: it is interpolated into a shell command, and an
         // unquoted metacharacter in it would be a syntax error rather than a
@@ -1152,6 +1153,7 @@ mod tests {
         child
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_real_timeout_still_escalates_the_child() {
         use std::os::unix::process::ExitStatusExt;

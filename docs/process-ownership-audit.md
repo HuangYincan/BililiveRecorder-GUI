@@ -50,7 +50,7 @@ termination. There are no other production process wait/signal sites in
 
 ## Tests and drivers (not production guarantees)
 
-- `lib.rs:1177`: unit-test status poll after shutting down its own stand-in.
+- `lib.rs:1179`: unit-test status poll after shutting down its own stand-in.
   New `monitor_tests` use **no OS child**, inject monitor wait failure and count
   interrupt/kill/wait operations. Three error scenarios expect zero termination
   calls; EOF positive control expects interrupt + kill + wait.
