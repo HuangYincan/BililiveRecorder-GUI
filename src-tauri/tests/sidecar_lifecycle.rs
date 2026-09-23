@@ -20,7 +20,8 @@ use std::{
 
 use bililive_recorder_gui_lib::{
     BackendCommand, EVENT_ERROR_PREFIX, EVENT_EXITED, EVENT_STARTED_PREFIX, EVENT_STOPPED,
-    GuardianConfig, UNRECLAIMED_BACKEND_MESSAGE, shutdown_guardian, supervise, supervise_with,
+    GuardianConfig, UNRECLAIMED_BACKEND_MESSAGE, WaitOutcome, shutdown_guardian, supervise,
+    supervise_with, wait_for_exit,
 };
 use std::{io::Read, os::unix::net::UnixStream};
 
@@ -433,6 +434,93 @@ fn an_unreaped_child_keeps_its_pid_reserved() {
         !alive(pid),
         "once reaped, the pid is released — which is why nothing may signal it afterwards"
     );
+}
+
+/// A child whose `try_wait` fails, with its pid already released.
+///
+/// This is the real shape of the hazard: reaping a child behind `std`'s back
+/// makes the next `try_wait` report an error rather than "still running", which
+/// is exactly the state in which the pid may already belong to someone else.
+fn reaped_behind_stds_back() -> Child {
+    let child = Command::new(SHELL)
+        .args(["-c", &format!("exec sleep {LINGER}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("child should start");
+    let pid = child.id();
+
+    // End it first, so the reap below is immediate rather than a 300-second
+    // wait on a child that is still sleeping. The kill is of a child this
+    // process spawned, and it is the *reap* that puts the pid out of reach.
+    assert_eq!(
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) },
+        0,
+        "the stand-in should be signalled"
+    );
+    let mut status = 0;
+    let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+    assert_eq!(reaped, pid as libc::pid_t, "the raw reap should succeed");
+    child
+}
+
+#[test]
+fn a_failed_wait_is_classified_as_unwaitable_rather_than_a_timeout() {
+    // The bug this pins: timeout and wait-failure both used to come back as the
+    // same value, and the shutdown paths then signalled a pid whose ownership
+    // the failure had just called into question.
+    let mut child = reaped_behind_stds_back();
+
+    assert_eq!(
+        wait_for_exit(&mut child, Duration::from_secs(1)),
+        WaitOutcome::Unwaitable
+    );
+}
+
+#[test]
+fn a_failed_wait_does_not_hold_the_guardian_path_open_and_signals_nothing() {
+    // A failure must short-circuit. If it were treated as "keep polling", this
+    // call would burn the whole of `patience`; taking the error branch returns
+    // `None` at once, and `None` is the only outcome of `shutdown_guardian`
+    // that signals nothing.
+    let mut child = reaped_behind_stds_back();
+    let patience = Duration::from_secs(4);
+
+    let started = Instant::now();
+    let outcome = shutdown_guardian(&mut child, patience);
+    let elapsed = started.elapsed();
+
+    assert_eq!(outcome, None, "an unwaitable guardian is not escalated");
+    assert!(
+        elapsed < patience / 2,
+        "a failed wait should not be polled to the deadline: took {elapsed:?}"
+    );
+}
+
+#[test]
+fn a_genuine_timeout_is_still_a_timeout_and_still_ours() {
+    // The other half of the distinction: a child that really is alive when the
+    // deadline passes must not be swept into the unwaitable bucket, because its
+    // pid is the one thing the escalation path is allowed to signal.
+    let mut child = Command::new(SHELL)
+        .args(["-c", &format!("exec sleep {LINGER}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("child should start");
+
+    let outcome = wait_for_exit(&mut child, Duration::from_millis(300));
+
+    assert_eq!(outcome, WaitOutcome::TimedOut);
+    assert!(
+        outcome.pid_is_still_ours(),
+        "an unreaped, still-running child is the only signalable outcome"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 // ---------------------------------------------------------------------------

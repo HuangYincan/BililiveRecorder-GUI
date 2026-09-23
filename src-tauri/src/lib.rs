@@ -323,6 +323,54 @@ fn send_interrupt(pid: u32) -> bool {
     }
 }
 
+/// What a bounded wait on a child actually settled.
+///
+/// Three outcomes, not two. A wait that *failed* is not a wait that *timed
+/// out*: a timeout says the child is still running and still unreaped, so its
+/// pid is provably this process's to signal; a failure says nothing at all
+/// about the child. Collapsing the two is how a pid stops being owned — an
+/// error from [`Child::try_wait`] is exactly the case where the child may
+/// already have been reaped out from under us and its pid handed to an
+/// unrelated process, so it must never be signalled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitOutcome {
+    /// Reaped, and this is the code it exited with.
+    Exited(i32),
+    /// Still running when the deadline passed: unreaped, therefore still ours.
+    TimedOut,
+    /// The wait itself failed. The child's state is unknown, so ownership is
+    /// not established and no signal may be sent to its pid.
+    Unwaitable,
+}
+
+impl WaitOutcome {
+    /// Whether this outcome leaves the child's pid provably this process's own.
+    ///
+    /// Only a timeout does. An exit has already released the pid, and a failed
+    /// wait establishes nothing about it.
+    pub fn pid_is_still_ours(self) -> bool {
+        matches!(self, WaitOutcome::TimedOut)
+    }
+}
+
+/// Polls `child` until it exits or `within` elapses, keeping the three outcomes
+/// distinct.
+///
+/// The `Err` arm is deliberately matched *before* the deadline check: it is the
+/// one result that must never be read as "still running", and a timeout that
+/// had already been reached is not a reason to reinterpret a failed wait.
+pub fn wait_for_exit(child: &mut Child, within: Duration) -> WaitOutcome {
+    let deadline = Instant::now() + within;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return WaitOutcome::Exited(status.code().unwrap_or(-1)),
+            Err(_) => return WaitOutcome::Unwaitable,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
+            Ok(None) => return WaitOutcome::TimedOut,
+        }
+    }
+}
+
 /// Ends the guardian, if this platform can do so safely.
 ///
 /// **Every signal this program sends goes to a `Child` it spawned itself and
@@ -353,25 +401,15 @@ fn send_interrupt(pid: u32) -> bool {
 /// Returns the guardian's exit code when it could be reaped, `None` when it
 /// could not be ended safely.
 pub fn shutdown_guardian(guardian: &mut Child, patience: Duration) -> Option<i32> {
-    let pid = guardian.id();
-    let code = |status: std::process::ExitStatus| Some(status.code().unwrap_or(-1));
-
-    let wait_out = |guardian: &mut Child, within: Duration| -> Option<Option<i32>> {
-        let deadline = Instant::now() + within;
-        loop {
-            match guardian.try_wait() {
-                Ok(Some(status)) => return Some(code(status)),
-                Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
-                // Reaped, or unwaitable: either way its pid is no longer ours
-                // and nothing below may signal it.
-                _ => return None,
-            }
-        }
-    };
-
     // The ordinary case: the guardian shut the backend down and finished.
-    if let Some(exit) = wait_out(guardian, patience) {
-        return exit;
+    match wait_for_exit(guardian, patience) {
+        WaitOutcome::Exited(code) => return Some(code),
+        // The wait failed, so we cannot say the guardian is still running — and
+        // a pid we cannot claim is the one thing this module refuses to signal.
+        // There is nothing to escalate to either: `guardian.kill()` would reach
+        // the same unverified pid by a different route.
+        WaitOutcome::Unwaitable => return None,
+        WaitOutcome::TimedOut => {}
     }
 
     // Hung, not slow. On macOS this is where convergence stops: killing the
@@ -382,34 +420,48 @@ pub fn shutdown_guardian(guardian: &mut Child, patience: Duration) -> Option<i32
         return None;
     }
 
-    // Elsewhere the kernel will take the backend down with the guardian, so
-    // there is nothing left to reason about — only a `Child` this app owns.
+    // Elsewhere the kernel will take the backend down with the guardian, and
+    // the wait above confirmed the guardian is alive and unreaped, so this pid
+    // is exact rather than remembered.
     #[cfg(unix)]
     unsafe {
-        libc::kill(pid as libc::c_int, libc::SIGTERM);
+        libc::kill(guardian.id() as libc::c_int, libc::SIGTERM);
     }
 
-    if let Some(exit) = wait_out(guardian, GUARDIAN_EXIT_MARGIN) {
-        return exit;
+    match wait_for_exit(guardian, GUARDIAN_EXIT_MARGIN) {
+        WaitOutcome::Exited(code) => return Some(code),
+        // Same rule for the escalation: a failed wait leaves nothing to claim.
+        WaitOutcome::Unwaitable => return None,
+        WaitOutcome::TimedOut => {}
     }
 
+    // Last resort. The wait just before this proved the guardian is still
+    // unreaped, so `kill` reaches the same pid this `Child` still holds.
     let _ = guardian.kill();
-    guardian.wait().ok().and_then(code)
+    guardian
+        .wait()
+        .ok()
+        .map(|status| status.code().unwrap_or(-1))
 }
 
 /// Walks the guardian's own child through the two-stage shutdown.
 fn shutdown_child(child: &mut Child, graceful_timeout: Duration) {
+    // No wait has happened yet, so this child is still unreaped and its pid is
+    // unambiguously ours — including on the platforms where `send_interrupt`
+    // declines and we fall straight through to `kill`.
     if send_interrupt(child.id()) {
-        let deadline = Instant::now() + graceful_timeout;
-        loop {
-            match child.try_wait() {
-                // Reaped: from here on the pid is free, and nothing below may
-                // signal it again.
-                Ok(Some(_)) => return,
-                Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
-                Ok(None) => break,
-                Err(_) => break,
-            }
+        match wait_for_exit(child, graceful_timeout) {
+            // Reaped: the pid is free, and nothing below may signal it again.
+            WaitOutcome::Exited(_) => return,
+            // The wait failed, so ownership of this pid is no longer
+            // established. Escalating to `child.kill()` would signal it anyway
+            // on the strength of having spawned it earlier — the same stale-pid
+            // hazard through a different doorway. Where the kernel ties the
+            // backend to this process it is the kernel that reclaims this one;
+            // on macOS nothing does, which is the documented limit.
+            WaitOutcome::Unwaitable => return,
+            // Confirmed still running and unreaped, so escalation is exact.
+            WaitOutcome::TimedOut => {}
         }
     }
     let _ = child.kill();
@@ -1009,6 +1061,82 @@ mod tests {
 
     fn parse(args: &[&str]) -> Option<GuardianConfig> {
         GuardianConfig::from_args(args.iter().copied())
+    }
+
+    #[test]
+    fn only_a_timeout_leaves_a_pid_we_may_still_signal() {
+        // The distinction the shutdown paths turn on: an exit has released the
+        // pid, and a failed wait establishes nothing about it, so the only
+        // outcome that licenses a signal is a confirmed-still-running child.
+        assert!(WaitOutcome::TimedOut.pid_is_still_ours());
+        assert!(!WaitOutcome::Exited(0).pid_is_still_ours());
+        assert!(!WaitOutcome::Exited(-1).pid_is_still_ours());
+        assert!(!WaitOutcome::Unwaitable.pid_is_still_ours());
+    }
+
+    /// Starts a stand-in backend that ignores the interrupt, and returns only
+    /// once it is *known* to be ignoring it.
+    ///
+    /// The marker matters: a `trap` installed by the child races any signal the
+    /// parent sends, and a child killed by the interrupt before it reaches the
+    /// `trap` would die looking exactly like one ended by the escalation. The
+    /// test below has to tell those apart, so it waits for the child to say it
+    /// is ready.
+    fn stubborn_child(ready: &std::path::Path) -> Child {
+        // The path is quoted: it is interpolated into a shell command, and an
+        // unquoted metacharacter in it would be a syntax error rather than a
+        // failure the test could explain.
+        let script = format!("trap '' INT; : > '{}'; exec sleep 300", ready.display());
+        let child = Command::new("/bin/sh")
+            .args(["-c", &script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("stand-in backend should start");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the stand-in never installed its interrupt handler"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child
+    }
+
+    #[test]
+    fn a_real_timeout_still_escalates_the_child() {
+        use std::os::unix::process::ExitStatusExt;
+
+        // Keeping timeout distinct from failure must not soften the timeout
+        // path: a child that ignored the interrupt and outlived the grace
+        // period is still confirmed ours, and is still ended — by the
+        // escalation, not by the interrupt it already refused.
+        let ready = std::env::temp_dir().join(format!(
+            "nvc-stubborn-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock is after the epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&ready);
+        let mut child = stubborn_child(&ready);
+
+        shutdown_child(&mut child, Duration::from_millis(400));
+
+        let status = child
+            .try_wait()
+            .expect("the child can still be waited on")
+            .expect("the child must not survive the escalation");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "the child should have been escalated to, not stopped by the interrupt"
+        );
+        let _ = std::fs::remove_file(&ready);
     }
 
     #[test]
