@@ -19,7 +19,8 @@ use std::{
 };
 
 use bililive_recorder_gui_lib::{
-    BackendCommand, EVENT_ERROR_PREFIX, EVENT_EXITED, EVENT_STOPPED, GuardianConfig, supervise,
+    BackendCommand, EVENT_ERROR_PREFIX, EVENT_EXITED, EVENT_STARTED_PREFIX, EVENT_STOPPED,
+    GuardianConfig, kernel_children_of, shutdown_guardian, supervise,
 };
 use std::{io::Read, os::unix::net::UnixStream};
 
@@ -70,8 +71,20 @@ impl Supervisor {
         self.keepalive = None;
     }
 
-    /// Waits for the guardian to finish and returns what it reported.
+    /// Waits for the guardian to finish, returning its exit code and the last
+    /// event it wrote — the one outcome it settled on.
+    ///
+    /// The transcript opens with a `started` line naming the backend pid, so
+    /// the terminal line, not the whole transcript, is what says how it ended.
     fn finish(self) -> (i32, String) {
+        let (code, text) = self.finish_full();
+        let last = text.lines().last().unwrap_or_default().trim().to_owned();
+        (code, last)
+    }
+
+    /// Waits for the guardian to finish, returning its exit code and every
+    /// event it wrote, in order.
+    fn finish_full(self) -> (i32, String) {
         let code = self.handle.join().expect("guardian thread panicked");
         let mut text = String::new();
         let mut events = self.events;
@@ -415,5 +428,141 @@ fn an_unreaped_child_keeps_its_pid_reserved() {
     assert!(
         !alive(pid),
         "once reaped, the pid is released — which is why nothing may signal it afterwards"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The guardian itself dying or hanging
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_guardian_that_exits_on_its_own_is_reaped_without_escalation() {
+    // The ordinary case: the guardian finished its job. Nothing should be
+    // escalated at it, and its exit code must come back.
+    let mut guardian = Command::new(SHELL)
+        .args(["-c", "exit 7"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("guardian stand-in should start");
+
+    let code = shutdown_guardian(&mut guardian, Duration::from_secs(5));
+    assert_eq!(code, Some(7), "a guardian that exited must report its code");
+    assert!(!alive(guardian.id()) || guardian.try_wait().is_ok());
+}
+
+#[test]
+fn a_hung_guardian_is_escalated_and_reaped() {
+    // A guardian that will not take the polite request. `shutdown_guardian`
+    // holds it as an unreaped `Child`, so escalating is exact; the point of the
+    // test is that the app is not left waiting forever.
+    let mut guardian = Command::new(SHELL)
+        .args(["-c", "trap '' TERM; exec sleep 300"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("guardian stand-in should start");
+    let pid = guardian.id();
+    assert!(alive(pid), "the stand-in should be running");
+
+    let started = Instant::now();
+    let _ = shutdown_guardian(&mut guardian, Duration::from_millis(300));
+    let elapsed = started.elapsed();
+
+    assert!(
+        !alive(pid),
+        "a hung guardian must not survive the escalation"
+    );
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "escalation must be bounded, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn the_kernel_names_the_children_of_a_live_process() {
+    // The hung-guardian path asks the kernel for the guardian's children
+    // instead of scanning for a process that looks like ours. This pins that
+    // the answer is real, and that it goes away once the parent is reaped.
+    //
+    // The child prints its own pid to a file rather than down a pipe: a pipe
+    // would be inherited by the child too, so reading it to end of file would
+    // block until the child was gone — exactly when the enumeration under test
+    // would have nothing left to find.
+    let pid_file = std::env::temp_dir().join(format!("nvc-children-{}.pid", std::process::id()));
+    let _ = std::fs::remove_file(&pid_file);
+
+    let mut parent = Command::new(SHELL)
+        .args([
+            "-c",
+            &format!(
+                "sleep 3 >/dev/null 2>&1 & echo $! > {}; wait",
+                pid_file.display()
+            ),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("parent should start");
+    let parent_pid = parent.id();
+
+    let mut recorded = None;
+    wait_until(
+        "the parent to record its child's pid",
+        Duration::from_secs(5),
+        || {
+            recorded = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok());
+            recorded.is_some()
+        },
+    );
+    let child_pid = recorded.expect("the parent should record its child's pid");
+
+    let children = kernel_children_of(parent_pid);
+    assert!(
+        children.contains(&child_pid),
+        "the kernel must name {child_pid} as a child of {parent_pid}, got {children:?}"
+    );
+    assert!(
+        alive(child_pid),
+        "the kernel must not name a pid that is not running"
+    );
+
+    // The parent exits on its own once the child does, so nothing is left
+    // behind and nothing has to be signalled to get here.
+    let _ = parent.wait();
+    let _ = std::fs::remove_file(&pid_file);
+    assert!(
+        kernel_children_of(parent_pid).is_empty(),
+        "a reaped process must report no children"
+    );
+}
+
+#[test]
+fn the_guardian_reports_the_backend_pid_it_owns() {
+    // The app is told the backend's pid so a human can be pointed at it when
+    // something has already gone wrong. It is never signalled, so this only has
+    // to be true and to arrive before anything else.
+    let mut supervisor = Supervisor::start(lingering("4341"));
+    wait_for_child("4341", Duration::from_secs(5));
+    let owned = own_children("4341");
+    assert_eq!(owned.len(), 1, "exactly one backend should be running");
+
+    supervisor.request_shutdown();
+    let (code, events) = supervisor.finish_full();
+    assert_eq!(code, 0, "guardian should stop cleanly, events: {events}");
+
+    let started = events
+        .lines()
+        .find_map(|line| line.strip_prefix(EVENT_STARTED_PREFIX))
+        .expect("the guardian must report the backend pid");
+    assert_eq!(
+        started.trim().parse::<u32>().ok(),
+        Some(owned[0]),
+        "the reported pid must be the backend the guardian actually owns"
     );
 }

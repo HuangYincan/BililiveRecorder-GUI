@@ -69,8 +69,12 @@ BILILIVE_RECORDER_VERSION=v2.20.0 npm run sidecar:prepare
 ## 已知限制
 
 - **只有 macOS 经过实测，不宣称跨平台保证已成立。** 守护进程不使用任何平台特有接口（一个 `Child` 加两条管道），因此在 Windows/Linux 上同样构建与分发，所有权论证也照样成立（Windows 在进程句柄打开期间同样不会复用 PID，`Child` 会持有该句柄直到 `wait`），但这是推理而非实测。Windows 上以下行为从未被观测：应用死亡是否可靠关闭守护进程阻塞的那条管道写端（整条崩溃/`SIGKILL` 路径都依赖它）、是否有其他进程持有一份写端副本导致守护进程永不唤醒、无控制台启动时守护进程自身的启动与退出行为。
-- Windows 后端无法被礼貌停止（无控制台子进程收不到 `Ctrl+C`），停止时直接强制终止，不给 CLI 落盘机会；也没有使用 Job Object 作为兜底。Linux 同样未经实测。
-- 若**守护进程自身**被强制杀死而应用仍在运行，就没有任何进程再持有后端。应用会通过守护进程事件管道读到文件结束并报错退出，但无法接管后端，该后端需要手工停止。
+- Windows 后端无法被礼貌停止（无控制台子进程收不到 `Ctrl+C`），停止时直接强制终止，不给 CLI 落盘机会。守护进程会为后端建立 **Job Object**（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`），因此守护进程被杀时内核会连同后端一起结束；Linux 同理由 `PR_SET_PDEATHSIG` 覆盖。**这两段平台代码只做过类型检查，从未运行过**（见下）。
+- 守护进程被杀或卡死时的收敛（按平台分层）：
+  - 守护进程**卡死**：应用把它当作自己的 `Child` 持有，其 PID 在回收前不会被复用，因此可以直接升级 `SIGTERM` → `SIGKILL`；升级前先向内核查询它名下的子进程（Linux `/proc/<pid>/task/<pid>/children`、macOS `proc_listchildpids`）并先请它们退出。这在三个平台上都成立。
+  - 守护进程**被杀**：Linux 由 `PR_SET_PDEATHSIG`、Windows 由 Job Object 在内核层解决。
+  - **macOS 是缺口**：macOS 既没有 `PR_SET_PDEATHSIG` 也没有 Job Object，守护进程被强杀后后端会被 `launchd` 收养，应用既无法证明它是那个后端，也不能安全地向它发信号。此时应用会读到事件管道结束、报错退出，并在弹窗中点名后端进程号，由用户手工停止。要真正堵上需要内核级回收器（launchd agent / 系统扩展），与这个缺陷的规模不相称。
+- **平台代码的验证程度**：`src-tauri/src/platform.rs` 已对 macOS / Linux / Windows 三个目标做过 `cargo check`（借助独立的最小 crate 绕开 tauri 的 C 依赖），但**从未在 Linux 或 Windows 上运行过**。`src-tauri/tests/artifact_lifecycle.rs` 是跨平台的产物级终止测试，同样只在本机编译过，两个用例默认 `#[ignore]`，需要可丢弃机器才会执行。
 - Linux 与 Windows 安装包尚未实机验证；GitHub Actions 工作流用于持续补齐构建结果。
 - sidecar 下载依赖 GitHub Release；正式发布应同时保存资产校验值并对桌面安装包签名/公证。
 - Tauri updater 包已有独立签名链；macOS Developer ID 签名与 Apple 公证仍需仓库所有者提供 Apple 凭据。

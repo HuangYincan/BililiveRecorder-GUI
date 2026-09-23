@@ -49,15 +49,59 @@
 //!
 //! Windows also cannot be asked politely: a console-less child cannot be sent
 //! `Ctrl+C`, so shutdown there is a forced termination that gives the CLI no
-//! chance to flush, and no Job Object is used as a backstop. Linux is
-//! unmeasured as well.
+//! chance to flush.
 //!
-//! # Known residual
+//! What *has* been checked is narrower than running it. `platform.rs` — the
+//! job object, `PR_SET_PDEATHSIG`, and the two ways of asking the kernel for a
+//! process's children — type-checks for all three targets, by way of a minimal
+//! crate that avoids tauri's C dependencies (`cargo check` needs no linker, but
+//! `aws-lc-sys` wants `windows.h` and `gdk-sys` wants GTK, so the crate as a
+//! whole cannot be cross-checked). Type-checking is not running, and none of it
+//! has run on Windows or Linux.
 //!
-//! If the *guardian* is killed outright while the app is still running, nothing
-//! is left holding the backend. The app notices (the guardian's event pipe
-//! reaches end of file) and reports it, but it cannot adopt the backend, so
-//! that backend would have to be stopped by hand.
+//! # When the guardian itself dies or hangs
+//!
+//! The guardian is a poll loop whose only blocking call — the `read` on the
+//! keepalive pipe — runs on its own thread, but it can still be killed or
+//! stopped from outside. The app holds the guardian as its own `Child`, so the
+//! guardian is the one process the app can always address exactly, and
+//! convergence is layered strongest-first:
+//!
+//! | Case | Linux | Windows | macOS |
+//! | --- | --- | --- | --- |
+//! | guardian **killed** | kernel takes the backend with it (`PR_SET_PDEATHSIG`) | kernel takes the backend with it (Job Object, kill-on-close) | **not contained** — see below |
+//! | guardian **hung** | app asks the kernel for the guardian's children, stops those, then escalates on the guardian | killing the guardian closes the job, which takes the backend | app asks the kernel for the guardian's children, stops those, then escalates on the guardian |
+//! | guardian **exits normally** | it has already reaped the backend | same | same |
+//!
+//! A hung guardian is recoverable everywhere. The app owns it as a real `Child`,
+//! so its pid cannot have been recycled while that `Child` is unreaped, and
+//! escalating `SIGTERM` then `SIGKILL` on the guardian is exact. Before it
+//! escalates, the app asks the *kernel* which processes are children of the
+//! guardian — `/proc/<pid>/task/<pid>/children` on Linux,
+//! `proc_listchildpids` on macOS — and asks those to stop first. That is a
+//! parent/child relation the kernel maintains, not a scan for a process that
+//! looks like ours, and never a bare pid.
+//!
+//! ## The macOS hole, stated plainly
+//!
+//! macOS has no `PR_SET_PDEATHSIG` and no Job Object. A process there cannot
+//! make the kernel take its descendants down with it, and the backend is the
+//! upstream CLI, so it cannot be asked to watch its own parent either. If the
+//! guardian is **killed outright on macOS while the app is still alive**, the
+//! backend survives, reparented to `launchd`; the app can neither prove it is
+//! that backend nor safely signal it. The app reports it — the guardian's event
+//! pipe reaching end of file is the trigger — and names the pid and the port so
+//! it can be stopped by hand. Closing that hole needs one of:
+//!
+//! * a kernel-side reaper (a launchd agent, or a system extension) that adopts
+//!   orphans — out of proportion to this bug, and a signing burden;
+//! * wrapping the backend in a further process that *is* killed with its parent
+//!   — which moves the same problem one level down rather than solving it;
+//! * accepting it: the guardian is not exposed to untrusted input, opens no
+//!   socket, and its only blocking read fails closed, so killing it takes the
+//!   same privilege as killing the app itself.
+//!
+//! Linux and Windows need no such caveat, and are contained by the kernel.
 
 use std::{
     ffi::OsString,
@@ -68,7 +112,7 @@ use std::{
     process::{Child, ChildStdout, Command, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicI32, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -76,6 +120,11 @@ use std::{
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_updater::UpdaterExt;
+
+mod platform;
+
+/// Re-exported so the regression tests can drive the same code the app runs.
+pub use platform::kernel_children_of;
 
 const SIDECAR_NAME: &str = "BililiveRecorder.Cli";
 
@@ -97,6 +146,13 @@ pub const EVENT_STOPPED: &str = "stopped";
 pub const EVENT_EXITED: &str = "exited";
 /// The guardian could not do its job; the rest of the line says why.
 pub const EVENT_ERROR_PREFIX: &str = "error: ";
+/// Followed by the backend's pid, reported once at startup.
+///
+/// **Diagnostics only.** The app never signals a pid it read from a pipe; the
+/// guardian remains the only thing that touches the backend. This exists so a
+/// human can be told which process to look at when something has already gone
+/// wrong, and so a support log says what the app was actually running.
+pub const EVENT_STARTED_PREFIX: &str = "started ";
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const TARGET_TRIPLE: &str = "aarch64-apple-darwin";
@@ -146,7 +202,7 @@ impl GuardianConfig {
     {
         let mut args = args.into_iter().map(Into::into);
         let _executable = args.next()?;
-        if args.next()? != OsString::from(GUARDIAN_FLAG) {
+        if args.next()? != GUARDIAN_FLAG {
             return None;
         }
 
@@ -229,6 +285,55 @@ fn send_interrupt(pid: u32) -> bool {
     }
 }
 
+/// Ends the guardian, giving up only once it is gone.
+///
+/// `guardian` was spawned by this app and has not been reaped, so the kernel
+/// still reserves its pid for exactly this process — the same ownership
+/// argument the guardian itself relies on, and what makes the escalation below
+/// exact rather than a guess.
+///
+/// Returns the guardian's exit code when it could be reaped.
+pub fn shutdown_guardian(guardian: &mut Child, patience: Duration) -> Option<i32> {
+    let pid = guardian.id();
+    let code = |status: std::process::ExitStatus| Some(status.code().unwrap_or(-1));
+
+    let deadline = Instant::now() + patience;
+    loop {
+        match guardian.try_wait() {
+            Ok(Some(status)) => return code(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
+            _ => break,
+        }
+    }
+
+    // Still there: hung, not slow. Whatever it started has to be asked to stop
+    // first, because once the guardian is gone the kernel reparents them and
+    // the app can no longer name them.
+    for child in platform::kernel_children_of(pid) {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(child as libc::c_int, libc::SIGTERM);
+        }
+    }
+
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as libc::c_int, libc::SIGTERM);
+    }
+
+    let deadline = Instant::now() + GUARDIAN_EXIT_MARGIN;
+    loop {
+        match guardian.try_wait() {
+            Ok(Some(status)) => return code(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
+            _ => break,
+        }
+    }
+
+    let _ = guardian.kill();
+    guardian.wait().ok().and_then(code)
+}
+
 /// Walks the guardian's own child through the two-stage shutdown.
 fn shutdown_child(child: &mut Child, graceful_timeout: Duration) {
     if send_interrupt(child.id()) {
@@ -279,6 +384,10 @@ where
         command.creation_flags(0x0800_0000);
     }
 
+    // Linux: the kernel kills the backend when the guardian dies, even if the
+    // guardian is SIGKILLed and never runs another line of its own code.
+    platform::arm_parent_death(&mut command);
+
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -289,6 +398,23 @@ where
             return 1;
         }
     };
+
+    // Windows: a job whose handle this process holds. The kernel closes that
+    // handle when the guardian dies, and closing it kills everything in the
+    // job — so a killed guardian still takes the backend with it. A failure
+    // here is not fatal: it costs the backstop, not the backend.
+    if let Err(error) = platform::adopt_backend_into_job(&child) {
+        write_event(
+            &mut events,
+            &format!("{EVENT_ERROR_PREFIX}无法为录播后端建立作业对象：{error}"),
+        );
+    }
+
+    // Diagnostics only. The app must never signal a pid it read from a pipe.
+    write_event(
+        &mut events,
+        &format!("{EVENT_STARTED_PREFIX}{}", child.id()),
+    );
 
     // End of file on the keepalive pipe is the only signal that also arrives
     // when the app was killed outright, so it is watched from its own thread.
@@ -355,9 +481,23 @@ struct BackendState {
     /// that pipe is the only way the app asks for a shutdown.
     guardian: Mutex<Option<Child>>,
     stopping: AtomicBool,
+    /// The backend pid the guardian reported. **Never signalled** — kept only
+    /// so that a failure can tell a human which process to look at.
+    backend_pid: AtomicU32,
 }
 
 fn reserve_local_port() -> Result<u16, String> {
+    // Test seam. The artifact lifecycle test needs to know where to look
+    // without enumerating processes — which is exactly the thing that must not
+    // be done on a shared machine. An unusable value is ignored, not fatal.
+    if let Some(port) = std::env::var_os("BILILIVE_GUI_BIND_PORT")
+        .and_then(|raw| raw.to_str().and_then(|raw| raw.parse::<u16>().ok()))
+        && port != 0
+        && TcpListener::bind(("127.0.0.1", port)).is_ok()
+    {
+        return Ok(port);
+    }
+
     TcpListener::bind(("127.0.0.1", 0))
         .and_then(|listener| listener.local_addr())
         .map(|address| address.port())
@@ -435,6 +575,14 @@ fn watch_guardian(app: tauri::AppHandle, events: ChildStdout) {
             if app.state::<BackendState>().stopping.load(Ordering::SeqCst) {
                 return;
             }
+            if let Some(pid) = line.strip_prefix(EVENT_STARTED_PREFIX) {
+                if let Ok(pid) = pid.trim().parse() {
+                    app.state::<BackendState>()
+                        .backend_pid
+                        .store(pid, Ordering::SeqCst);
+                }
+                continue;
+            }
             if line == EVENT_EXITED {
                 report_fatal(&app, "录播后端意外退出，请查看应用日志。");
             } else if let Some(detail) = line.strip_prefix(EVENT_ERROR_PREFIX) {
@@ -447,7 +595,20 @@ fn watch_guardian(app: tauri::AppHandle, events: ChildStdout) {
         }
 
         if !app.state::<BackendState>().stopping.load(Ordering::SeqCst) {
-            report_fatal(&app, "录播后端守护进程异常退出，后端可能仍在运行。");
+            // The guardian is gone without having shut the backend down. On
+            // macOS the kernel cannot take the backend with it, so say which
+            // process and port to look at instead of leaving the user to find
+            // it. Naming a pid is safe: nothing here signals it.
+            let pid = app
+                .state::<BackendState>()
+                .backend_pid
+                .load(Ordering::SeqCst);
+            let detail = if pid == 0 {
+                "录播后端守护进程异常退出，录播后端可能仍在运行。".to_owned()
+            } else {
+                format!("录播后端守护进程异常退出，录播后端（进程号 {pid}）可能仍在运行。")
+            };
+            report_fatal(&app, &detail);
             app.exit(1);
         }
     });
@@ -472,15 +633,14 @@ fn stop_backend(app: &tauri::AppHandle) {
     };
     drop(guardian.stdin.take());
 
-    let deadline = Instant::now() + GUARDIAN_GRACEFUL_TIMEOUT + GUARDIAN_EXIT_MARGIN;
-    loop {
-        match guardian.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
-            Ok(None) => return,
-            Err(_) => return,
-        }
-    }
+    // The guardian now shuts the backend down and reaps it. If it does not
+    // finish in time it is hung rather than slow, and it has to be ended: it is
+    // held as an unreaped `Child`, so this is exact, and on Linux and Windows
+    // the kernel takes the backend down with it.
+    let _ = shutdown_guardian(
+        &mut guardian,
+        GUARDIAN_GRACEFUL_TIMEOUT + GUARDIAN_EXIT_MARGIN,
+    );
 }
 
 async fn start_backend(app: &tauri::AppHandle) -> Result<String, String> {
