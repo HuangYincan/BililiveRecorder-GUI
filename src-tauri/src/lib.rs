@@ -29,10 +29,35 @@
 //! recordings and exit cleanly, escalating to `SIGKILL` only after
 //! [`GUARDIAN_GRACEFUL_TIMEOUT`].
 //!
-//! Known residual: if the *guardian* is killed outright while the app is still
-//! running, nothing is left holding the backend. The app notices (the guardian's
-//! event pipe reaches end of file) and reports it, but it cannot adopt the
-//! backend, so that backend would have to be stopped by hand.
+//! # Platform support boundary
+//!
+//! **Only macOS has been measured. No cross-platform guarantee is claimed.**
+//!
+//! The guardian uses nothing platform-specific — one `Child` plus two pipes —
+//! so it builds and ships for Windows and Linux too, and the ownership argument
+//! carries over unchanged: Windows likewise will not hand out a pid while a
+//! handle to that process object is open, and `Child` holds one until `wait`.
+//! But that is reasoning, not measurement. For Windows specifically, none of
+//! the following has ever been observed:
+//!
+//! * whether the app's death reliably closes the write end of the pipe the
+//!   guardian blocks on, so that it actually sees end of file — the entire
+//!   crash and `SIGKILL` path depends on this;
+//! * whether anything else ends up holding a copy of that write end, which
+//!   would keep the guardian from ever waking;
+//! * how the guardian starts and exits when launched without a console.
+//!
+//! Windows also cannot be asked politely: a console-less child cannot be sent
+//! `Ctrl+C`, so shutdown there is a forced termination that gives the CLI no
+//! chance to flush, and no Job Object is used as a backstop. Linux is
+//! unmeasured as well.
+//!
+//! # Known residual
+//!
+//! If the *guardian* is killed outright while the app is still running, nothing
+//! is left holding the backend. The app notices (the guardian's event pipe
+//! reaches end of file) and reports it, but it cannot adopt the backend, so
+//! that backend would have to be stopped by hand.
 
 use std::{
     ffi::OsString,

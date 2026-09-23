@@ -131,14 +131,27 @@ fn alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::c_int, 0) == 0 }
 }
 
-fn spawn_decoy(marker: &str) -> Child {
+/// Starts a stand-in recorder that this test owns, so it may reap it.
+fn spawn_owned(script: &str) -> Child {
     Command::new(SHELL)
-        .args(["-c", &format!("exec sleep {marker}")])
+        .args(["-c", script])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("decoy should start")
+}
+
+fn spawn_decoy(marker: &str) -> Child {
+    spawn_owned(&format!("exec sleep {marker}"))
+}
+
+fn wait_until(what: &str, timeout: Duration, mut ready: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while !ready() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
@@ -231,6 +244,44 @@ fn a_recorder_the_user_started_is_never_touched() {
     assert!(
         alive(their_pid),
         "a backend the app did not start must survive regardless of how it was launched"
+    );
+
+    let _ = theirs.kill();
+    let _ = theirs.wait();
+}
+
+#[test]
+fn an_identical_instance_on_the_same_path_is_left_alone() {
+    // Stronger than the previous test: the unrelated recorder runs the *same
+    // program with the same arguments* as the guardian's own backend, so
+    // nothing about the two can be told apart by inspecting the process table.
+    // Ownership is the only thing that separates them — which is the point.
+    let script = "exec sleep 4331";
+    let mut theirs = spawn_owned(script);
+    wait_until(
+        "the unrelated recorder to start",
+        Duration::from_secs(5),
+        || own_children("4331").len() == 1,
+    );
+
+    let mut guardian = Supervisor::start(backend(script, Duration::from_secs(5)));
+    wait_until(
+        "the guardian's own backend to start",
+        Duration::from_secs(5),
+        || own_children("4331").len() == 2,
+    );
+
+    guardian.request_shutdown();
+    let (code, report) = guardian.finish();
+
+    assert_eq!(code, 0);
+    assert_eq!(report, EVENT_STOPPED);
+
+    let survivors = own_children("4331");
+    assert_eq!(
+        survivors,
+        vec![theirs.id()],
+        "only the guardian's own child may be reaped; the identical unrelated instance must survive"
     );
 
     let _ = theirs.kill();
