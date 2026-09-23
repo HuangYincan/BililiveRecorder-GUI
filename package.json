@@ -11,7 +11,7 @@
     "release:validate": "node scripts/validate-release.mjs",
     "desktop:dev": "npm run sidecar:prepare && tauri dev",
     "desktop:build": "npm run sidecar:prepare && tauri build",
-    "check": "npm run build && cargo check --manifest-path src-tauri/Cargo.toml"
+    "check": "npm run build && cargo check --manifest-path src-tauri/Cargo.toml && cargo test --manifest-path src-tauri/Cargo.toml"
   },
   "dependencies": {},
   "devDependencies": {
