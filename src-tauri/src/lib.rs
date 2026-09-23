@@ -162,6 +162,8 @@ use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_updater::UpdaterExt;
 
+#[doc(hidden)]
+pub mod artifact_probe;
 mod platform;
 
 const SIDECAR_NAME: &str = "BililiveRecorder.Cli";
@@ -844,6 +846,7 @@ fn stop_backend(app: &tauri::AppHandle) {
     let Some(mut guardian) = guardian else {
         return;
     };
+    artifact_probe::record("stop-backend-start");
     drop(guardian.stdin.take());
 
     // The guardian now shuts the backend down and reaps it. If it does not
@@ -853,6 +856,13 @@ fn stop_backend(app: &tauri::AppHandle) {
         &mut guardian,
         GUARDIAN_GRACEFUL_TIMEOUT + GUARDIAN_EXIT_MARGIN,
     );
+
+    artifact_probe::record(if exit.is_some() {
+        "guardian-wait-exited"
+    } else {
+        "guardian-wait-unsettled"
+    });
+    artifact_probe::record("stop-backend-returned");
 
     // Nothing to converge, and the guardian is still there: on this platform
     // ending it would orphan the backend rather than reclaim it. Say so — the
@@ -987,6 +997,7 @@ async fn check_for_updates(app: tauri::AppHandle) {
 
 async fn launch_main_window(app: tauri::AppHandle) -> Result<(), String> {
     let base_url = start_backend(&app).await?;
+    artifact_probe::record("backend-ready");
     let webui_url =
         url::Url::parse(&format!("{base_url}/ui/")).map_err(|error| error.to_string())?;
     let window = WebviewWindowBuilder::new(&app, "main", WebviewUrl::External(webui_url.clone()))
@@ -998,6 +1009,7 @@ async fn launch_main_window(app: tauri::AppHandle) -> Result<(), String> {
         .build()
         .map_err(|error| error.to_string())?;
 
+    artifact_probe::record("main-window-created");
     tokio::time::sleep(Duration::from_millis(400)).await;
     window
         .navigate(webui_url)
@@ -1005,6 +1017,7 @@ async fn launch_main_window(app: tauri::AppHandle) -> Result<(), String> {
     tokio::time::sleep(Duration::from_millis(800)).await;
     window.show().map_err(|error| error.to_string())?;
     window.set_focus().map_err(|error| error.to_string())?;
+    artifact_probe::record("main-window-ready");
 
     tauri::async_runtime::spawn(check_for_updates(app));
     Ok(())
@@ -1053,6 +1066,38 @@ fn watch_for_signals(app: tauri::AppHandle) {
 #[cfg(not(unix))]
 fn watch_for_signals(_app: tauri::AppHandle) {}
 
+// A test-only control pipe, enabled explicitly on the app spawned by the
+// disposable-runner harness. It asks the exact Tauri main window to close;
+// never bypass CloseRequested by calling exit(), destroy(), or stop_backend().
+#[cfg(windows)]
+fn install_artifact_close_driver(app: tauri::AppHandle) {
+    if !artifact_probe::enabled() {
+        return;
+    }
+    std::thread::spawn(move || {
+        match artifact_probe::read_close_request(io::stdin().lock()) {
+            Ok(true) => {
+                artifact_probe::record("close-command-received");
+                match app.get_webview_window("main") {
+                    Some(window) => match window.close() {
+                        Ok(()) => artifact_probe::record("close-command-posted"),
+                        Err(error) => {
+                            artifact_probe::record("close-command-failed");
+                            eprintln!("artifact close request failed: {error}");
+                        }
+                    },
+                    None => artifact_probe::record("close-command-no-window"),
+                }
+            }
+            Ok(false) => {} // EOF or an unknown command is not a close request.
+            Err(error) => eprintln!("artifact control pipe failed: {error}"),
+        }
+    });
+}
+
+#[cfg(not(windows))]
+fn install_artifact_close_driver(_app: tauri::AppHandle) {}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     install_signal_handlers();
@@ -1063,6 +1108,7 @@ pub fn run() {
         .manage(BackendState::default())
         .setup(|app| {
             let handle = app.handle().clone();
+            install_artifact_close_driver(handle.clone());
             watch_for_signals(handle.clone());
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = launch_main_window(handle.clone()).await {
@@ -1076,12 +1122,14 @@ pub fn run() {
             if window.label() == "main"
                 && let tauri::WindowEvent::CloseRequested { api, .. } = event
             {
+                artifact_probe::record("close-requested");
                 api.prevent_close();
                 // Reaping here, before the window goes away, keeps the backend
                 // from outliving its UI. `RunEvent::Exit` runs the same
                 // idempotent shutdown again and finds nothing left to do.
                 stop_backend(window.app_handle());
                 let _ = window.hide();
+                artifact_probe::record("exit-invoked");
                 window.app_handle().exit(0);
             }
         })
@@ -1089,6 +1137,11 @@ pub fn run() {
         .expect("error while building BililiveRecorder GUI");
 
     app.run(|app, event| {
+        match &event {
+            tauri::RunEvent::ExitRequested { .. } => artifact_probe::record("run-exit-requested"),
+            tauri::RunEvent::Exit => artifact_probe::record("run-exit"),
+            _ => {}
+        }
         // `Exit` is the event a normal macOS quit delivers (`applicationWillTerminate`
         // -> `LoopDestroyed`); `ExitRequested` covers closes and `exit()` calls.
         // Both are handled because either can be the last one to run.

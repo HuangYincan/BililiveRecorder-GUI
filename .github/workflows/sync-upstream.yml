@@ -52,7 +52,7 @@ jobs:
             Automated upstream sync.
 
             - Updates `upstream.json`
-            - Aligns desktop/updater version with the upstream release
+            - Advances the desktop/updater version past its prior version, independently of the upstream version
             - Build jobs fetch the official CLI assets, which already contain the matching official WebUI
           labels: upstream-sync
       - name: Enable automatic merge
@@ -69,7 +69,9 @@ jobs:
           for attempt in $(seq 1 60); do
             MERGED_AT=$(gh pr view "$PR_NUMBER" --json mergedAt --jq '.mergedAt // empty')
             if [ -n "$MERGED_AT" ]; then
-              gh workflow run release.yml --ref main -f source_pr="$PR_NUMBER"
+              MERGE_SHA=$(gh pr view "$PR_NUMBER" --json mergeCommit --jq '.mergeCommit.oid // empty')
+              test -n "$MERGE_SHA"
+              gh workflow run release.yml --ref main -f source_pr="$PR_NUMBER" -f approved_sha="$MERGE_SHA"
               exit 0
             fi
             STATE=$(gh pr view "$PR_NUMBER" --json state --jq .state)
