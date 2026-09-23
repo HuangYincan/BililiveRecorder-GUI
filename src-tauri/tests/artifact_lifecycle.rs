@@ -23,6 +23,30 @@
 //! from outside the process table entirely: the app is told which port to use
 //! and the verdict is whether that port still answers.
 //!
+//! # What the verdict does and does not prove
+//!
+//! "The app exited" and "the backend stopped" are different claims, and neither
+//! is "the recording was flushed to disk". This tool keeps them apart instead
+//! of collapsing them into one pass:
+//!
+//! | Signal | How it is observed | What it proves |
+//! | --- | --- | --- |
+//! | backend stopped serving | the loopback port stops answering | the backend is no longer accepting requests — **not** that the process is gone, and not that it flushed |
+//! | recording flushed | the bundled CLI's own log ends in a clean shutdown | the CLI reached its shutdown path rather than being cut off mid-write |
+//! | the app exited | `Child::wait` on the process this tool started | the app itself is gone, and with what exit status |
+//!
+//! **The backend process exiting is deliberately not observed here.** The only
+//! ways to see it are enumerating the process table or reading the guardian's
+//! event pipe, and this tool does neither: enumeration is what made the deleted
+//! shell script unsafe, and the app consumes the event pipe itself. So a pass
+//! here means "the backend stopped serving and the CLI reported a clean
+//! shutdown", which is the property users care about, but it is not a claim
+//! about the process table.
+//!
+//! The flush signal is only checked when `BILILIVE_ARTIFACT_CLI_LOG` points at
+//! the CLI's log file; without it the tool says so rather than implying it
+//! proved something it did not.
+//!
 //! # Running it
 //!
 //! ```text
@@ -193,9 +217,13 @@ impl App {
         false
     }
 
-    /// Reaps the app. Nothing may signal it afterwards.
-    fn reap(&mut self) {
-        let _ = self.child.wait();
+    /// Reaps the app, returning its exit code. Nothing may signal it
+    /// afterwards.
+    fn reap(&mut self) -> Option<i32> {
+        self.child
+            .wait()
+            .ok()
+            .map(|status| status.code().unwrap_or(-1))
     }
 }
 
@@ -208,6 +236,27 @@ impl Drop for App {
     }
 }
 
+/// Where the bundled CLI writes its log, if the caller said.
+///
+/// The app passes `BILILIVERECORDER_LOG_FILE_PATH` to the CLI; whoever runs
+/// this tool knows the app's log directory, so it is supplied rather than
+/// guessed.
+fn cli_log_path() -> Option<PathBuf> {
+    std::env::var_os("BILILIVE_ARTIFACT_CLI_LOG").map(PathBuf::from)
+}
+
+/// Whether the CLI's log shows it reached its shutdown path.
+///
+/// `None` means the question was not asked — no log path was supplied, or the
+/// file is not there — and the caller must report that as unproven rather than
+/// as a pass.
+fn recording_was_flushed() -> Option<bool> {
+    let path = cli_log_path()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    // The upstream CLI logs these as it disposes of its recording pipeline.
+    Some(text.contains("Shutdown in progress") || text.contains("Dispose called"))
+}
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .expect("a free port")
@@ -216,18 +265,39 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// A user quitting the app must take the backend down.
+/// A user quitting the app must take the backend down, and the CLI must get
+/// the chance to flush.
 #[test]
 #[ignore = "launches and terminates a real app; needs a disposable machine"]
 fn quitting_the_app_stops_the_backend() {
     acknowledged();
     let mut app = App::launch(free_port());
     app.request_quit();
+
+    let stopped_serving = app.observe_backend_shutdown();
+    let flushed = recording_was_flushed();
+    let exit = app.reap();
+
     assert!(
-        app.observe_backend_shutdown(),
-        "the backend was still listening after the app was asked to quit"
+        stopped_serving,
+        "the backend was still serving after the app was asked to quit"
     );
-    app.reap();
+    assert!(
+        exit.is_some(),
+        "the app was never reaped after being asked to quit"
+    );
+    if flushed == Some(false) {
+        panic!(
+            "the backend stopped serving but the CLI log shows no clean \
+             shutdown, so the recording may have been cut off mid-write"
+        );
+    }
+    if flushed.is_none() {
+        eprintln!(
+            "note: BILILIVE_ARTIFACT_CLI_LOG was not supplied or unreadable, so \
+             the flush signal is UNPROVEN for this run"
+        );
+    }
 }
 
 /// An app killed outright must still take the backend down. This is the path
@@ -238,9 +308,19 @@ fn killing_the_app_stops_the_backend() {
     acknowledged();
     let mut app = App::launch(free_port());
     app.kill();
+
+    let stopped_serving = app.observe_backend_shutdown();
+    let flushed = recording_was_flushed();
+    let _ = app.reap();
+
     assert!(
-        app.observe_backend_shutdown(),
+        stopped_serving,
         "the backend outlived an app that was killed outright"
     );
-    app.reap();
+    // A forced kill cannot promise a flush; the guardian's graceful stage is
+    // what gives the CLI its chance. Report it, do not assert it.
+    match flushed {
+        Some(value) => eprintln!("note: CLI reported a clean shutdown: {value}"),
+        None => eprintln!("note: flush signal UNPROVEN (no CLI log supplied)"),
+    }
 }

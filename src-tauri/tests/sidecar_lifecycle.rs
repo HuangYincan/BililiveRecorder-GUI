@@ -20,7 +20,7 @@ use std::{
 
 use bililive_recorder_gui_lib::{
     BackendCommand, EVENT_ERROR_PREFIX, EVENT_EXITED, EVENT_STARTED_PREFIX, EVENT_STOPPED,
-    GuardianConfig, kernel_children_of, shutdown_guardian, supervise,
+    GuardianConfig, contain_or_refuse, kernel_children_of, shutdown_guardian, supervise,
 };
 use std::{io::Read, os::unix::net::UnixStream};
 
@@ -564,5 +564,98 @@ fn the_guardian_reports_the_backend_pid_it_owns() {
         started.trim().parse::<u32>().ok(),
         Some(owned[0]),
         "the reported pid must be the backend the guardian actually owns"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Containment must fail closed
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_backend_that_cannot_be_contained_is_stopped_not_left_running() {
+    // Failure injection for the platform containment step, which on Windows is
+    // the job object. Where containment cannot be established the backend must
+    // not be left running: the app would be recording under a guarantee it
+    // cannot keep. The closure stands in for a failing job object so this can
+    // be exercised on any platform.
+    let mut child = spawn_owned("4351");
+    let pid = child.id();
+    assert!(alive(pid), "the stand-in backend should be running");
+
+    let outcome = contain_or_refuse(&mut child, |_| Err("注入的失败".to_owned()));
+
+    assert!(outcome.is_err(), "a failed containment must be reported");
+    assert!(
+        !alive(pid),
+        "the backend must be stopped, not left running without containment"
+    );
+}
+
+#[test]
+fn a_backend_that_can_be_contained_keeps_running() {
+    // The other half of the decision: success must not stop anything.
+    let mut child = spawn_owned("4352");
+    let pid = child.id();
+
+    contain_or_refuse(&mut child, |_| Ok(())).expect("containment should succeed");
+
+    assert!(alive(pid), "a contained backend must be left alone");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+// ---------------------------------------------------------------------------
+// A hung guardian must not orphan what it started
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_hung_guardian_takes_a_stubborn_child_down_with_it() {
+    // The path luna found: if the guardian is killed before its child, the
+    // child is reparented at that instant and the app can no longer reach it.
+    // Both stages here refuse SIGTERM, so this only passes if the child is
+    // drained *while the guardian is still alive to name it* and then escalated
+    // to SIGKILL, before the guardian itself is killed.
+    //
+    // `trap '' TERM` survives `exec`, so the sleep genuinely ignores SIGTERM.
+    let pid_file = std::env::temp_dir().join(format!("nvc-drain-{}.pid", std::process::id()));
+    let _ = std::fs::remove_file(&pid_file);
+
+    let mut guardian = Command::new(SHELL)
+        .args([
+            "-c",
+            &format!(
+                "sh -c 'trap \"\" TERM; exec sleep 300' & echo $! > {}; trap \"\" TERM; wait",
+                pid_file.display()
+            ),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the hung guardian stand-in should start");
+    let guardian_pid = guardian.id();
+
+    let mut recorded = None;
+    wait_until(
+        "the guardian to record its child's pid",
+        Duration::from_secs(5),
+        || {
+            recorded = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok());
+            recorded.is_some()
+        },
+    );
+    let child_pid = recorded.expect("the guardian should record its child's pid");
+    let _ = std::fs::remove_file(&pid_file);
+    assert!(alive(child_pid), "the stubborn child should be running");
+
+    let _ = shutdown_guardian(&mut guardian, Duration::from_millis(300));
+
+    assert!(!alive(guardian_pid), "the hung guardian must be reaped");
+    assert!(
+        !alive(child_pid),
+        "the guardian's child was orphaned: it must be drained before the \
+         guardian is killed, not after"
     );
 }

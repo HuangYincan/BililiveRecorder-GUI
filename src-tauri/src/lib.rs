@@ -70,17 +70,35 @@
 //! | Case | Linux | Windows | macOS |
 //! | --- | --- | --- | --- |
 //! | guardian **killed** | kernel takes the backend with it (`PR_SET_PDEATHSIG`) | kernel takes the backend with it (Job Object, kill-on-close) | **not contained** — see below |
-//! | guardian **hung** | app asks the kernel for the guardian's children, stops those, then escalates on the guardian | killing the guardian closes the job, which takes the backend | app asks the kernel for the guardian's children, stops those, then escalates on the guardian |
+//! | guardian **hung** | app drains the guardian's children first, then escalates on the guardian | killing the guardian closes the job, which takes the backend | app drains the guardian's children first, then escalates on the guardian |
 //! | guardian **exits normally** | it has already reaped the backend | same | same |
 //!
-//! A hung guardian is recoverable everywhere. The app owns it as a real `Child`,
-//! so its pid cannot have been recycled while that `Child` is unreaped, and
-//! escalating `SIGTERM` then `SIGKILL` on the guardian is exact. Before it
-//! escalates, the app asks the *kernel* which processes are children of the
-//! guardian — `/proc/<pid>/task/<pid>/children` on Linux,
-//! `proc_listchildpids` on macOS — and asks those to stop first. That is a
-//! parent/child relation the kernel maintains, not a scan for a process that
-//! looks like ours, and never a bare pid.
+//! A hung guardian is recoverable everywhere, but **the order is the whole
+//! point**: the guardian's children are taken down *before* the guardian is,
+//! never after. Killing the guardian first reparents them at that instant and
+//! the app can no longer name them — that is exactly the orphan this design
+//! exists to prevent, and it is reachable from the ordinary quit path, not only
+//! from an external kill.
+//!
+//! So while the guardian is still alive the app asks the *kernel* which
+//! processes are its children — `/proc/<pid>/task/<pid>/children` on Linux,
+//! `proc_listchildpids` on macOS — stops them, waits for them to actually go,
+//! and escalates them to `SIGKILL` if they will not. Only when nothing of the
+//! guardian's is left does the guardian itself get signalled.
+//!
+//! That list is authoritative precisely *because* the guardian is still alive:
+//! a live process's child links cannot be stale. It is re-derived on every pass
+//! and never remembered, so no pid is ever signalled on the strength of an
+//! observation made earlier — a recycled pid that is not the guardian's child
+//! at the moment of signalling never appears in the list and is never touched.
+//! It is not a scan for a process that looks like ours, and never a bare pid.
+
+//! ## Windows containment fails closed
+//!
+//! Where the job object cannot be established, the backend is stopped and the
+//! guardian exits non-zero rather than running it unprotected: without the job,
+//! "the backend cannot outlive the guardian" would simply be false on that
+//! machine, and the app will not record under a guarantee it cannot keep.
 //!
 //! ## The macOS hole, stated plainly
 //!
@@ -135,6 +153,9 @@ pub const GUARDIAN_FLAG: &str = "--bililive-sidecar-guardian";
 pub const GUARDIAN_GRACEFUL_TIMEOUT: Duration = Duration::from_secs(8);
 /// Extra time the app gives the guardian to finish after that.
 const GUARDIAN_EXIT_MARGIN: Duration = Duration::from_secs(4);
+/// How long the guardian's descendants get to exit at each escalation stage
+/// once the guardian itself has stopped making progress.
+const GUARDIAN_DESCENDANT_GRACE: Duration = Duration::from_secs(3);
 /// How often the guardian and the app re-check the state they are watching.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Timeout applied when the guardian is asked for its version by a human.
@@ -285,6 +306,52 @@ fn send_interrupt(pid: u32) -> bool {
     }
 }
 
+/// Takes everything the guardian started down, before the guardian itself.
+///
+/// Only meaningful while the guardian is **still alive**: a live process's
+/// child list is maintained by the kernel and cannot be stale, so a pid
+/// reported here really is its child at that moment. Once the guardian dies the
+/// kernel reparents its children and this can no longer name them at all —
+/// which is exactly why this runs first and why the order is not negotiable.
+///
+/// The list is re-derived from the live guardian on every pass. It is never
+/// remembered and acted on later, so this is not a "check a pid, then signal it
+/// some time afterwards" pattern: each signal follows an observation made in
+/// the same iteration. A pid that has been recycled onto something else will
+/// not appear in the guardian's child list at all and is therefore never
+/// signalled; a pid that has been recycled onto *another child of this same
+/// guardian* is still inside the subtree being taken down, so signalling it is
+/// the intended action rather than a mistake.
+#[cfg(unix)]
+fn drain_descendants(guardian_pid: u32, grace: Duration) {
+    for signal in [libc::SIGTERM, libc::SIGKILL] {
+        let deadline = Instant::now() + grace;
+        loop {
+            let children = platform::kernel_children_of(guardian_pid);
+            if children.is_empty() {
+                return;
+            }
+            for child in children {
+                // Safe because the guardian is still alive and still ours: it
+                // has not been signalled or reaped, so its pid is reserved and
+                // it cannot have been replaced by an unrelated process.
+                unsafe { libc::kill(child as libc::c_int, signal) };
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+}
+
+/// Windows has no child list to drain: killing the guardian closes its job,
+/// and the kernel takes the backend with it.
+#[cfg(not(unix))]
+fn drain_descendants(guardian_pid: u32, grace: Duration) {
+    let _ = (guardian_pid, grace);
+}
+
 /// Ends the guardian, giving up only once it is gone.
 ///
 /// `guardian` was spawned by this app and has not been reaped, so the kernel
@@ -292,44 +359,49 @@ fn send_interrupt(pid: u32) -> bool {
 /// argument the guardian itself relies on, and what makes the escalation below
 /// exact rather than a guess.
 ///
+/// The order matters and is the whole point of this function. A hung guardian
+/// is *not* killed first: its children would be reparented at that instant and
+/// become unreachable, which is precisely the orphan this app exists to
+/// prevent. They are drained while the guardian is still alive to name them,
+/// and only then does the guardian itself go.
+///
 /// Returns the guardian's exit code when it could be reaped.
 pub fn shutdown_guardian(guardian: &mut Child, patience: Duration) -> Option<i32> {
     let pid = guardian.id();
     let code = |status: std::process::ExitStatus| Some(status.code().unwrap_or(-1));
 
-    let deadline = Instant::now() + patience;
-    loop {
-        match guardian.try_wait() {
-            Ok(Some(status)) => return code(status),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
-            _ => break,
+    let wait_out = |guardian: &mut Child, within: Duration| -> Option<Option<i32>> {
+        let deadline = Instant::now() + within;
+        loop {
+            match guardian.try_wait() {
+                Ok(Some(status)) => return Some(code(status)),
+                Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
+                // Reaped, or unwaitable: either way its pid is no longer ours
+                // and nothing below may signal it.
+                _ => return None,
+            }
         }
+    };
+
+    // The ordinary case: the guardian finished its job on its own.
+    if let Some(exit) = wait_out(guardian, patience) {
+        return exit;
     }
 
-    // Still there: hung, not slow. Whatever it started has to be asked to stop
-    // first, because once the guardian is gone the kernel reparents them and
-    // the app can no longer name them.
-    for child in platform::kernel_children_of(pid) {
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(child as libc::c_int, libc::SIGTERM);
-        }
-    }
+    // Hung, not slow. Everything it started has to be gone *before* it is, so
+    // that nothing is orphaned by its death.
+    drain_descendants(pid, GUARDIAN_DESCENDANT_GRACE);
 
     #[cfg(unix)]
     unsafe {
         libc::kill(pid as libc::c_int, libc::SIGTERM);
     }
 
-    let deadline = Instant::now() + GUARDIAN_EXIT_MARGIN;
-    loop {
-        match guardian.try_wait() {
-            Ok(Some(status)) => return code(status),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
-            _ => break,
-        }
+    if let Some(exit) = wait_out(guardian, GUARDIAN_EXIT_MARGIN) {
+        return exit;
     }
 
+    // Last resort, and now safe: it has no children left to orphan.
     let _ = guardian.kill();
     guardian.wait().ok().and_then(code)
 }
@@ -351,6 +423,31 @@ fn shutdown_child(child: &mut Child, graceful_timeout: Duration) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Applies platform containment, and refuses to run the backend without it.
+///
+/// `contain` is injected rather than called directly so the failure path can be
+/// exercised on any platform, not only the one that has a job object.
+///
+/// This fails **closed** on purpose. The promise is that the backend cannot
+/// outlive the guardian; where that cannot be established the app stops the
+/// backend instead of running it unprotected, because the alternative is to
+/// record with a guarantee the app cannot actually keep. A backend that died
+/// before it could be contained is not an error worth escalating: the caller
+/// reports and exits either way.
+pub fn contain_or_refuse<F>(child: &mut Child, contain: F) -> Result<(), String>
+where
+    F: FnOnce(&Child) -> Result<(), String>,
+{
+    match contain(child) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(error)
+        }
+    }
 }
 
 fn write_event<W: Write>(events: &mut W, line: &str) {
@@ -401,13 +498,15 @@ where
 
     // Windows: a job whose handle this process holds. The kernel closes that
     // handle when the guardian dies, and closing it kills everything in the
-    // job — so a killed guardian still takes the backend with it. A failure
-    // here is not fatal: it costs the backstop, not the backend.
-    if let Err(error) = platform::adopt_backend_into_job(&child) {
+    // job — so a killed guardian still takes the backend with it. If the job
+    // cannot be established the backend is stopped rather than run without the
+    // guarantee; see `contain_or_refuse`.
+    if let Err(error) = contain_or_refuse(&mut child, platform::adopt_backend_into_job) {
         write_event(
             &mut events,
-            &format!("{EVENT_ERROR_PREFIX}无法为录播后端建立作业对象：{error}"),
+            &format!("{EVENT_ERROR_PREFIX}无法为录播后端建立作业对象，已停止后端：{error}"),
         );
+        return 1;
     }
 
     // Diagnostics only. The app must never signal a pid it read from a pipe.
