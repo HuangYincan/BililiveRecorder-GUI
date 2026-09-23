@@ -12,6 +12,7 @@
     "desktop:version-test": "node --test scripts/desktop-version.test.mjs",
     "release:manifest": "node scripts/generate-release-manifest.mjs",
     "release:validate": "node scripts/validate-release.mjs",
+    "bundle:smoke": "node scripts/verify-packaged-sidecar.mjs",
     "desktop:dev": "npm run sidecar:prepare && tauri dev",
     "desktop:build": "npm run sidecar:prepare && tauri build",
     "check": "npm run build && cargo check --manifest-path src-tauri/Cargo.toml && cargo test --manifest-path src-tauri/Cargo.toml"

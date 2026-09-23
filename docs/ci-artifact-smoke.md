@@ -1,0 +1,5 @@
+# CI 产物验证（独立于 PR #3 生命周期实现）
+
+`Build desktop bundles` 在 GitHub-hosted macOS ARM64/Intel、Ubuntu x64、Windows x64 各自构建完成后运行 `npm run bundle:smoke`。这个检查不会启动或终止桌面应用，不使用用户工作目录；只在该 job 的临时目录解包自身生成的产物：macOS 从 `.app` 资源目录、Linux 从 `.deb`、Windows 通过 `msiexec /a` 管理映像从 `.msi` 定位所打包的 CLI，并执行 **该包内** CLI `--version`，比仅执行先前下载到 sidecar 暂存目录的 CLI 更接近真实交付。缺包、缺对应 target 的资源、运行失败或版本与 `upstream.json` 不同均令 job 失败。版本规则是 CLI `--version` 的输出必须是精确的 `X.Y.Z` 核心版本，可附带 `+` 后面的 SemVer 构建元数据（如 `2.20.0+Branch.tags-v2.20.0.Sha.<hash>`）；前缀、额外文本、不同主/次/补丁版本均拒绝。macOS 查找只限定于唯一 `.app` 内，不能用包外同名 CLI 冒充。测试不下载任何已发布资产、不改变已公开 tag。
+
+执行范围严格限定：此 smoke 可验证四类构建产物确实内置可启动的正确版本 CLI，**不是**安装包 GUI 首屏/安装器运行测试，不代表 Windows Job Object 杀树、macOS AppleEvent、后端进程表状态、录制文件落盘或 updater 下载验签。此 PR 现堆叠在 PR #3 上，因此同一 `build.yml` 同时保留 `artifact_lifecycle.rs` 的 DMG/DEB/MSI 安装及真实退出用例（仅在可丢弃 CI runner 上用 `BILILIVE_ARTIFACT_APP`、`BILILIVE_ARTIFACT_OK` 与日志/证据目录启用）；两组是**不同判据**，各自失败均不被另一项的通过掩盖。Windows 正常退出驱动是否真的送达、Linux AppImage/RPM 图形安装与更新、真实录制文件的完整性仍需独立证据；本 PR 没把未知结果算通过，也不回退共享主机测试。
