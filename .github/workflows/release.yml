@@ -39,6 +39,11 @@ jobs:
             echo "Approval SHA does not match main's checked-out commit" >&2
             exit 1
           fi
+          MAIN_SHA=$(git ls-remote --exit-code origin refs/heads/main | cut -f1)
+          if [ "$MAIN_SHA" != "$GITHUB_SHA" ]; then
+            echo "main advanced since this release was approved; review its new SHA" >&2
+            exit 1
+          fi
           VERSION=$(node -p "require('./package.json').version")
           TAG="app-v${VERSION}"
           # Do not silently overwrite the old release even if no release
@@ -51,15 +56,9 @@ jobs:
             echo "Release ${TAG} already exists; refusing to overwrite assets" >&2
             exit 1
           fi
-          # A missing latest release is valid for initial setup; any other
-          # lookup error must fail closed instead of publishing an unknown version.
-          if ! gh release view --json tagName --jq '.tagName' > latest-tag.txt; then
-            if [ -n "$(gh release list --limit 1 --json tagName --jq '.[].tagName')" ]; then
-              echo "Cannot determine latest release" >&2
-              exit 1
-            fi
-          fi
-          LATEST=$(cat latest-tag.txt 2>/dev/null || true)
+          # This repository already has a published updater release; a failed
+          # lookup is an error, not permission to publish an unverified tag.
+          LATEST=$(gh release view --json tagName --jq '.tagName')
           if [ -n "$LATEST" ]; then
             CURRENT_VERSION="$VERSION" LATEST_VERSION="${LATEST#app-v}" node --input-type=module -e '
               import { compareVersions } from "./scripts/desktop-version.mjs";
