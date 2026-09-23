@@ -158,7 +158,7 @@ jobs:
 
             Remove-Item $env:BILILIVE_ARTIFACT_CLI_LOG -Force -ErrorAction SilentlyContinue
             cargo test --manifest-path src-tauri/Cargo.toml --test artifact_lifecycle quitting_the_app_stops_the_backend -- --ignored --exact --nocapture 2>&1 | Tee-Object -FilePath (Join-Path $env:BILILIVE_ARTIFACT_EVIDENCE_DIR 'quit-test.log')
-            if ($LASTEXITCODE -ne 0) { throw "Artifact lifecycle test failed: $LASTEXITCODE" }
+            $quitExitCode = $LASTEXITCODE
             if (Test-Path $env:BILILIVE_ARTIFACT_CLI_LOG -PathType Leaf) {
               Copy-Item $env:BILILIVE_ARTIFACT_CLI_LOG (Join-Path $env:BILILIVE_ARTIFACT_EVIDENCE_DIR 'quit-cli.log')
             } else {
@@ -167,11 +167,16 @@ jobs:
 
             Remove-Item $env:BILILIVE_ARTIFACT_CLI_LOG -Force -ErrorAction SilentlyContinue
             cargo test --manifest-path src-tauri/Cargo.toml --test artifact_lifecycle killing_the_app_stops_the_backend -- --ignored --exact --nocapture 2>&1 | Tee-Object -FilePath (Join-Path $env:BILILIVE_ARTIFACT_EVIDENCE_DIR 'kill-test.log')
-            if ($LASTEXITCODE -ne 0) { throw "Artifact lifecycle test failed: $LASTEXITCODE" }
+            $killExitCode = $LASTEXITCODE
             if (Test-Path $env:BILILIVE_ARTIFACT_CLI_LOG -PathType Leaf) {
               Copy-Item $env:BILILIVE_ARTIFACT_CLI_LOG (Join-Path $env:BILILIVE_ARTIFACT_EVIDENCE_DIR 'kill-cli.log')
             } else {
               'UNPROVEN: forced termination does not promise recording flush.' | Out-File (Join-Path $env:BILILIVE_ARTIFACT_EVIDENCE_DIR 'kill-flush-unproven.txt')
+            }
+            # These are distinct verdicts. A quit driver failure must not skip
+            # the separate forced-kill case, but neither failure can turn green.
+            if ($quitExitCode -ne 0 -or $killExitCode -ne 0) {
+              throw "Artifact lifecycle verdicts: normal quit=$quitExitCode, forced kill=$killExitCode; see uploaded test logs"
             }
           }
           finally {
