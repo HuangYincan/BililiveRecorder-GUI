@@ -20,7 +20,7 @@ use std::{
 
 use bililive_recorder_gui_lib::{
     BackendCommand, EVENT_ERROR_PREFIX, EVENT_EXITED, EVENT_STARTED_PREFIX, EVENT_STOPPED,
-    GuardianConfig, contain_or_refuse, kernel_children_of, shutdown_guardian, supervise,
+    GuardianConfig, shutdown_guardian, supervise, supervise_with,
 };
 use std::{io::Read, os::unix::net::UnixStream};
 
@@ -453,96 +453,6 @@ fn a_guardian_that_exits_on_its_own_is_reaped_without_escalation() {
 }
 
 #[test]
-fn a_hung_guardian_is_escalated_and_reaped() {
-    // A guardian that will not take the polite request. `shutdown_guardian`
-    // holds it as an unreaped `Child`, so escalating is exact; the point of the
-    // test is that the app is not left waiting forever.
-    let mut guardian = Command::new(SHELL)
-        .args(["-c", "trap '' TERM; exec sleep 300"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("guardian stand-in should start");
-    let pid = guardian.id();
-    assert!(alive(pid), "the stand-in should be running");
-
-    let started = Instant::now();
-    let _ = shutdown_guardian(&mut guardian, Duration::from_millis(300));
-    let elapsed = started.elapsed();
-
-    assert!(
-        !alive(pid),
-        "a hung guardian must not survive the escalation"
-    );
-    assert!(
-        elapsed < Duration::from_secs(20),
-        "escalation must be bounded, took {elapsed:?}"
-    );
-}
-
-#[test]
-fn the_kernel_names_the_children_of_a_live_process() {
-    // The hung-guardian path asks the kernel for the guardian's children
-    // instead of scanning for a process that looks like ours. This pins that
-    // the answer is real, and that it goes away once the parent is reaped.
-    //
-    // The child prints its own pid to a file rather than down a pipe: a pipe
-    // would be inherited by the child too, so reading it to end of file would
-    // block until the child was gone — exactly when the enumeration under test
-    // would have nothing left to find.
-    let pid_file = std::env::temp_dir().join(format!("nvc-children-{}.pid", std::process::id()));
-    let _ = std::fs::remove_file(&pid_file);
-
-    let mut parent = Command::new(SHELL)
-        .args([
-            "-c",
-            &format!(
-                "sleep 3 >/dev/null 2>&1 & echo $! > {}; wait",
-                pid_file.display()
-            ),
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("parent should start");
-    let parent_pid = parent.id();
-
-    let mut recorded = None;
-    wait_until(
-        "the parent to record its child's pid",
-        Duration::from_secs(5),
-        || {
-            recorded = std::fs::read_to_string(&pid_file)
-                .ok()
-                .and_then(|text| text.trim().parse::<u32>().ok());
-            recorded.is_some()
-        },
-    );
-    let child_pid = recorded.expect("the parent should record its child's pid");
-
-    let children = kernel_children_of(parent_pid);
-    assert!(
-        children.contains(&child_pid),
-        "the kernel must name {child_pid} as a child of {parent_pid}, got {children:?}"
-    );
-    assert!(
-        alive(child_pid),
-        "the kernel must not name a pid that is not running"
-    );
-
-    // The parent exits on its own once the child does, so nothing is left
-    // behind and nothing has to be signalled to get here.
-    let _ = parent.wait();
-    let _ = std::fs::remove_file(&pid_file);
-    assert!(
-        kernel_children_of(parent_pid).is_empty(),
-        "a reaped process must report no children"
-    );
-}
-
-#[test]
 fn the_guardian_reports_the_backend_pid_it_owns() {
     // The app is told the backend's pid so a human can be pointed at it when
     // something has already gone wrong. It is never signalled, so this only has
@@ -568,56 +478,115 @@ fn the_guardian_reports_the_backend_pid_it_owns() {
 }
 
 // ---------------------------------------------------------------------------
-// Containment must fail closed
+// Containment is established before anything is spawned
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_backend_that_cannot_be_contained_is_stopped_not_left_running() {
+fn a_backend_never_gets_to_execute_when_containment_cannot_be_established() {
     // Failure injection for the platform containment step, which on Windows is
-    // the job object. Where containment cannot be established the backend must
-    // not be left running: the app would be recording under a guarantee it
-    // cannot keep. The closure stands in for a failing job object so this can
-    // be exercised on any platform.
-    let mut child = spawn_owned("4351");
-    let pid = child.id();
-    assert!(alive(pid), "the stand-in backend should be running");
+    // the job object. The seam is `supervise_with`.
+    //
+    // The property is stronger than "the backend is not left running": the
+    // constraint has to exist *before the backend has a chance to execute or
+    // spawn anything*, because a process already running can start children
+    // that containment would then have to chase. So the stand-in announces
+    // itself by creating a file the instant it starts, and the assertion is
+    // that the file never appears. A test that only checked for a surviving
+    // process would pass even if the backend had run and been killed
+    // afterwards, which is exactly the ordering that must not happen.
+    let announced = std::env::temp_dir().join(format!("nvc-ran-{}.flag", std::process::id()));
+    let _ = std::fs::remove_file(&announced);
 
-    let outcome = contain_or_refuse(&mut child, |_| Err("注入的失败".to_owned()));
+    let (guardian_side, _app_side) = UnixStream::pair().expect("keepalive pair");
+    let (events_out, mut events_in) = UnixStream::pair().expect("event pair");
+    let config = backend(
+        &format!("echo ran > {}; exec sleep {LINGER}", announced.display()),
+        Duration::from_secs(5),
+    );
 
-    assert!(outcome.is_err(), "a failed containment must be reported");
+    // The injected failure takes a moment before it gives up. That delay is
+    // what makes this deterministic: if containment runs before the spawn, no
+    // backend exists during it and the file can never appear; if containment
+    // ran after the spawn, the backend has that whole window to run and the
+    // file appears. Without the delay the check is a race the kill usually
+    // wins, which would let a post-spawn ordering pass — measured, not assumed.
+    let code = supervise_with(&config, guardian_side, events_out, || {
+        std::thread::sleep(Duration::from_millis(750));
+        Err("注入的失败".to_owned())
+    });
+
+    assert_eq!(code, 1, "a failed containment must not report success");
     assert!(
-        !alive(pid),
-        "the backend must be stopped, not left running without containment"
+        !announced.exists(),
+        "the backend executed before containment was established"
+    );
+
+    let mut events = String::new();
+    events_in
+        .read_to_string(&mut events)
+        .expect("read guardian events");
+    assert!(
+        events.trim().starts_with(EVENT_ERROR_PREFIX),
+        "the refusal must be reported, got {events:?}"
     );
 }
 
 #[test]
-fn a_backend_that_can_be_contained_keeps_running() {
-    // The other half of the decision: success must not stop anything.
-    let mut child = spawn_owned("4352");
-    let pid = child.id();
+fn containment_succeeding_lets_the_backend_execute() {
+    // The control for the test above: with containment established the backend
+    // does run and does announce itself. Without this, the negative result
+    // there would be consistent with the probe simply never working.
+    let announced = std::env::temp_dir().join(format!("nvc-ran-ok-{}.flag", std::process::id()));
+    let _ = std::fs::remove_file(&announced);
 
-    contain_or_refuse(&mut child, |_| Ok(())).expect("containment should succeed");
+    let (guardian_side, app_side) = UnixStream::pair().expect("keepalive pair");
+    let (events_out, mut events_in) = UnixStream::pair().expect("event pair");
+    let config = backend(
+        &format!("echo ran > {}; exec sleep {LINGER}", announced.display()),
+        Duration::from_secs(5),
+    );
 
-    assert!(alive(pid), "a contained backend must be left alone");
-    let _ = child.kill();
-    let _ = child.wait();
+    let handle =
+        std::thread::spawn(move || supervise_with(&config, guardian_side, events_out, || Ok(())));
+    wait_until(
+        "the backend to announce itself",
+        Duration::from_secs(5),
+        || announced.exists(),
+    );
+    assert!(
+        announced.exists(),
+        "the probe must work: an uncontained run has to create the file"
+    );
+    let _ = std::fs::remove_file(&announced);
+
+    drop(app_side);
+    let code = handle.join().expect("guardian thread panicked");
+    assert_eq!(code, 0, "an uncontended guardian should stop cleanly");
+
+    let mut events = String::new();
+    events_in
+        .read_to_string(&mut events)
+        .expect("read guardian events");
+    assert!(
+        events.contains(EVENT_STOPPED),
+        "the guardian should have settled, got {events:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
-// A hung guardian must not orphan what it started
+// A hung guardian
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_hung_guardian_takes_a_stubborn_child_down_with_it() {
-    // The path luna found: if the guardian is killed before its child, the
-    // child is reparented at that instant and the app can no longer reach it.
-    // Both stages here refuse SIGTERM, so this only passes if the child is
-    // drained *while the guardian is still alive to name it* and then escalated
-    // to SIGKILL, before the guardian itself is killed.
+fn a_hung_guardian_is_left_alone_where_ending_it_would_orphan_the_backend() {
+    // The safety property, stated as a test: this program must never signal a
+    // process it does not own. On macOS, ending a hung guardian cannot reclaim
+    // the backend — it can only orphan it — so the correct behaviour is to do
+    // nothing and report. An earlier revision reached for the guardian's
+    // children here, which risked hitting a recycled pid.
     //
-    // `trap '' TERM` survives `exec`, so the sleep genuinely ignores SIGTERM.
-    let pid_file = std::env::temp_dir().join(format!("nvc-drain-{}.pid", std::process::id()));
+    // The stand-ins refuse SIGTERM so the guardian is genuinely stuck.
+    let pid_file = std::env::temp_dir().join(format!("nvc-hung-{}.pid", std::process::id()));
     let _ = std::fs::remove_file(&pid_file);
 
     let mut guardian = Command::new(SHELL)
@@ -648,14 +617,34 @@ fn a_hung_guardian_takes_a_stubborn_child_down_with_it() {
     );
     let child_pid = recorded.expect("the guardian should record its child's pid");
     let _ = std::fs::remove_file(&pid_file);
-    assert!(alive(child_pid), "the stubborn child should be running");
 
-    let _ = shutdown_guardian(&mut guardian, Duration::from_millis(300));
+    let exit = shutdown_guardian(&mut guardian, Duration::from_millis(300));
 
-    assert!(!alive(guardian_pid), "the hung guardian must be reaped");
-    assert!(
-        !alive(child_pid),
-        "the guardian's child was orphaned: it must be drained before the \
-         guardian is killed, not after"
-    );
+    if cfg!(target_os = "macos") {
+        assert_eq!(exit, None, "macOS cannot converge a hung guardian");
+        assert!(
+            alive(guardian_pid),
+            "the hung guardian must be left running: ending it on macOS would \
+             orphan the backend rather than reclaim it"
+        );
+        assert!(
+            alive(child_pid),
+            "the backend must not be signalled — this program does not own it"
+        );
+    } else {
+        // Elsewhere the kernel ties the two together, so ending the guardian
+        // reclaims the backend and this must settle.
+        assert!(
+            !alive(guardian_pid),
+            "on a platform with parent-death containment the guardian must be ended"
+        );
+    }
+
+    // Clean up only what this test created, and only by handles it holds.
+    let _ = guardian.kill();
+    let _ = guardian.wait();
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(child_pid as libc::c_int, libc::SIGKILL);
+    }
 }

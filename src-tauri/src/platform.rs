@@ -7,65 +7,30 @@
 //! cross-checking the whole crate fails before it ever reaches Rust code. This
 //! module has no such dependency and *is* checked for Linux and Windows.
 //!
-//! Being type-checked is not being tested. Nothing in this file has been run on
-//! Windows or Linux; see the platform support boundary in `lib.rs`.
+//! Being type-checked is not being tested. See the platform support boundary in
+//! `lib.rs`.
+//!
+//! # The rule this module exists to keep
+//!
+//! Nothing here ever signals a process. Every signal in this program is sent to
+//! a [`std::process::Child`] the program spawned itself and has not reaped, so
+//! the kernel still reserves that pid. This module's job is only to make the
+//! *kernel* enforce that a process's descendants die with it, which is what lets
+//! the guardian's own death be enough.
 
-use std::process::{Child, Command};
+use std::process::Command;
 
-/// Pids the kernel reports as *direct children* of `pid`.
+/// Whether the kernel guarantees this process's descendants die with it.
 ///
-/// This is the kernel's own parent/child relation. It is consulted only when a
-/// guardian is alive but not making progress, and it is never used to decide
-/// whether a pid is ours: the caller holds the guardian as an unreaped `Child`,
-/// so the pid is still reserved, and a guardian that has been reaped has no
-/// children left for this to report.
-pub fn kernel_children_of(pid: u32) -> Vec<u32> {
-    #[cfg(target_os = "linux")]
-    {
-        match std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")) {
-            Ok(text) => text
-                .split_whitespace()
-                .filter_map(|field| field.parse().ok())
-                .collect(),
-            Err(_) => Vec::new(),
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let mut buffer = [0 as libc::c_int; 64];
-        // Returns how many pids were written, or a negative value on failure.
-        let written = unsafe {
-            libc::proc_listchildpids(
-                pid as libc::c_int,
-                buffer.as_mut_ptr().cast(),
-                std::mem::size_of_val(&buffer) as libc::c_int,
-            )
-        };
-        if written <= 0 {
-            return Vec::new();
-        }
-        let count = (written as usize).min(buffer.len());
-        buffer[..count]
-            .iter()
-            .map(|raw| *raw as u32)
-            .filter(|child| *child != 0)
-            .collect()
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        // Windows needs none of this: killing the guardian closes its job,
-        // which the kernel has already tied to the backend's lifetime.
-        let _ = pid;
-        Vec::new()
-    }
-}
+/// True where a parent-death mechanism exists: `PR_SET_PDEATHSIG` on Linux, a
+/// job object on Windows. False on macOS, which has neither — so on macOS,
+/// ending the guardian orphans whatever it started rather than reclaiming it.
+pub const DESCENDANTS_DIE_WITH_THE_PROCESS: bool = cfg!(any(target_os = "linux", windows));
 
 /// Arms the backend to die with the guardian, where the kernel can do it.
 ///
 /// Linux only. macOS has no equivalent, and on Windows the job object in
-/// [`adopt_backend_into_job`] is the mechanism instead.
+/// [`contain_guardian`] is the mechanism instead.
 pub fn arm_parent_death(command: &mut Command) {
     #[cfg(target_os = "linux")]
     {
@@ -97,28 +62,42 @@ pub fn arm_parent_death(command: &mut Command) {
     }
 }
 
-/// Windows: puts the backend in a job the kernel kills with this process.
+/// Windows: puts **this process** in a job the kernel kills with it.
 ///
-/// The handle is deliberately never closed — the kernel closes it as this
-/// process dies, and closing it *is* the kill request
-/// (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`). That is what makes an outright
-/// killed guardian still take the backend with it.
+/// Called once at guardian startup, *before* the backend exists. That ordering
+/// is the point: a Windows job is inherited by child processes, so the backend
+/// — and anything the backend itself starts — joins the job automatically at
+/// creation. There is no window in which the backend runs uncontained, and no
+/// process is ever adopted into the job after it has had a chance to execute.
+///
+/// The handle is deliberately never closed on success: the kernel closes it as
+/// this process dies, and closing it *is* the kill request
+/// (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) for everything in the job.
+///
+/// On failure the handle is closed and an error is returned, so the caller can
+/// refuse to start the backend at all. Nothing has been spawned at that point,
+/// so there is no created process to converge — the failure branch is
+/// fail-closed by construction rather than by cleanup.
 ///
 /// Elsewhere there is nothing to do and this returns `Ok(())`.
-pub fn adopt_backend_into_job(child: &Child) -> Result<(), String> {
+pub fn contain_guardian() -> Result<(), String> {
     #[cfg(windows)]
     {
-        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
             SetInformationJobObject,
         };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
         unsafe {
             let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
             if job.is_null() {
-                return Err("CreateJobObject 失败".into());
+                return Err(format!(
+                    "CreateJobObject 失败：{}",
+                    std::io::Error::last_os_error()
+                ));
             }
 
             let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
@@ -130,14 +109,19 @@ pub fn adopt_backend_into_job(child: &Child) -> Result<(), String> {
                 std::mem::size_of_val(&limits) as u32,
             ) == 0
             {
-                return Err("SetInformationJobObject 失败".into());
+                let error = std::io::Error::last_os_error();
+                CloseHandle(job);
+                return Err(format!("SetInformationJobObject 失败：{error}"));
             }
 
-            if AssignProcessToJobObject(job, child.as_raw_handle() as _) == 0 {
-                return Err("AssignProcessToJobObject 失败".into());
+            if AssignProcessToJobObject(job, GetCurrentProcess()) == 0 {
+                let error = std::io::Error::last_os_error();
+                CloseHandle(job);
+                return Err(format!("AssignProcessToJobObject 失败：{error}"));
             }
 
-            // Intentionally leaked: the handle must outlive the backend.
+            // Intentionally leaked: the kernel must close this handle, because
+            // doing so is what takes the backend down.
             std::mem::forget(job);
         }
         Ok(())
@@ -145,7 +129,6 @@ pub fn adopt_backend_into_job(child: &Child) -> Result<(), String> {
 
     #[cfg(not(windows))]
     {
-        let _ = child;
         Ok(())
     }
 }

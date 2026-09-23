@@ -44,8 +44,18 @@
 //! about the process table.
 //!
 //! The flush signal is only checked when `BILILIVE_ARTIFACT_CLI_LOG` points at
-//! the CLI's log file; without it the tool says so rather than implying it
-//! proved something it did not.
+//! the CLI's log file, and it is read **from the length the file had before
+//! this run started**, so a shutdown recorded by an earlier session cannot be
+//! mistaken for this one's. Without the log path the tool says so rather than
+//! implying it proved something it did not.
+//!
+//! **It is not evidence about recording files.** A shutdown line in the log
+//! means the CLI entered its shutdown path; it does not mean any particular
+//! `.flv` is intact, complete, or was flushed before the process ended. Proving
+//! that needs the files themselves — readable, expected duration, expected
+//! checksum — checked separately, on the recording the run was actually
+//! writing. Nothing in this tool does that, and a pass here must not be read as
+//! if it did.
 //!
 //! # Running it
 //!
@@ -104,6 +114,9 @@ fn acknowledged() {
 struct App {
     child: Child,
     port: u16,
+    /// How long the CLI's log was before this run, so the flush signal is
+    /// bound to this run's own output.
+    log_length_before: u64,
 }
 
 impl App {
@@ -122,8 +135,13 @@ impl App {
             command.creation_flags(0x0800_0000);
         }
 
+        let log_length_before = cli_log_length_before();
         let child = command.spawn().expect("the app should start");
-        let app = Self { child, port };
+        let app = Self {
+            child,
+            port,
+            log_length_before,
+        };
         app.await_backend();
         app
     }
@@ -245,14 +263,33 @@ fn cli_log_path() -> Option<PathBuf> {
     std::env::var_os("BILILIVE_ARTIFACT_CLI_LOG").map(PathBuf::from)
 }
 
-/// Whether the CLI's log shows it reached its shutdown path.
+/// How long the CLI's log already was, before this run touched anything.
+///
+/// Read before the app is launched so that only what this run appends is
+/// searched later.
+fn cli_log_length_before() -> u64 {
+    cli_log_path()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map(|meta| meta.len())
+        .unwrap_or(0)
+}
+
+/// Whether the CLI's log shows it reached its shutdown path **during this run**.
 ///
 /// `None` means the question was not asked — no log path was supplied, or the
 /// file is not there — and the caller must report that as unproven rather than
 /// as a pass.
-fn recording_was_flushed() -> Option<bool> {
+fn recording_was_flushed(since: u64) -> Option<bool> {
     let path = cli_log_path()?;
-    let text = std::fs::read_to_string(path).ok()?;
+    let bytes = std::fs::read(path).ok()?;
+    // If the log was rotated or truncated the offset is meaningless; fall back
+    // to the whole file rather than silently reading nothing.
+    let tail = if bytes.len() as u64 >= since {
+        &bytes[since as usize..]
+    } else {
+        &bytes[..]
+    };
+    let text = String::from_utf8_lossy(tail);
     // The upstream CLI logs these as it disposes of its recording pipeline.
     Some(text.contains("Shutdown in progress") || text.contains("Dispose called"))
 }
@@ -275,7 +312,7 @@ fn quitting_the_app_stops_the_backend() {
     app.request_quit();
 
     let stopped_serving = app.observe_backend_shutdown();
-    let flushed = recording_was_flushed();
+    let flushed = recording_was_flushed(app.log_length_before);
     let exit = app.reap();
 
     assert!(
@@ -310,7 +347,7 @@ fn killing_the_app_stops_the_backend() {
     app.kill();
 
     let stopped_serving = app.observe_backend_shutdown();
-    let flushed = recording_was_flushed();
+    let flushed = recording_was_flushed(app.log_length_before);
     let _ = app.reap();
 
     assert!(
