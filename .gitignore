@@ -8,3 +8,8 @@ src-tauri/sidecar/*
 !src-tauri/sidecar/.gitkeep
 .DS_Store
 *.log
+.app-smoke-workdir/
+.dmg-mount-*/
+.install-smoke-*/
+.installed-*-workdir/
+bililive-recorder-webui-main.png

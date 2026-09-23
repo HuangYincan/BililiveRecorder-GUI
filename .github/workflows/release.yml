@@ -58,7 +58,7 @@ jobs:
           releaseDraft: true
           prerelease: false
           retryAttempts: 3
-          uploadUpdaterJson: true
+          includeUpdaterJson: true
           updaterJsonPreferNsis: true
           args: --target ${{ matrix.target }}
 
