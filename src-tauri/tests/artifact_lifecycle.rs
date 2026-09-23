@@ -76,7 +76,9 @@
 
 #![cfg(any(unix, windows))]
 
+use bililive_recorder_gui_lib::artifact_probe;
 use std::{
+    fs,
     net::{Ipv4Addr, SocketAddr, TcpStream},
     path::PathBuf,
     process::{Child, Command, Stdio},
@@ -114,6 +116,7 @@ fn acknowledged() {
 struct App {
     child: Child,
     port: u16,
+    trace: PathBuf,
     /// How long the CLI's log was before this run, so the flush signal is
     /// bound to this run's own output.
     log_length_before: u64,
@@ -123,12 +126,29 @@ impl App {
     fn launch(port: u16) -> Self {
         // The app hands this port to the backend verbatim, so the test can
         // watch the backend without ever enumerating a process.
+        let evidence = std::env::var_os("BILILIVE_ARTIFACT_EVIDENCE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let run = evidence.join(format!(
+            "gui-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&run).expect("create this run's evidence directory");
+        let trace = run.join("lifecycle.log");
+        fs::File::create(&trace).expect("create fresh trace before spawning app");
+        let output = fs::File::create(run.join("app-output.log")).expect("create app log");
         let mut command = Command::new(app_path());
         command
             .env("BILILIVE_GUI_BIND_PORT", port.to_string())
+            .env("BILILIVE_ARTIFACT_TRACE", &trace)
+            .env("BILILIVE_RECORDER_GUI_WORKDIR", run.join("recordings"))
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(Stdio::from(output.try_clone().expect("clone app log")))
+            .stderr(Stdio::from(output));
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -140,6 +160,7 @@ impl App {
         let app = Self {
             child,
             port,
+            trace,
             log_length_before,
         };
         app.await_backend();
@@ -195,12 +216,21 @@ impl App {
 
         #[cfg(windows)]
         {
-            // WM_CLOSE to the app's windows: the close-requested path.
-            let status = Command::new("taskkill")
-                .args(["/PID", &self.pid().to_string()])
-                .status()
-                .expect("taskkill should run");
-            assert!(status.success(), "taskkill could not ask the app to close");
+            // TCP readiness happens before the Tauri window is even created.
+            // Wait for the actual GUI, then require the app to acknowledge the
+            // close event: taskkill's exit code alone is not delivery evidence.
+            request_quit_when_ready(&self.trace, self.pid(), STARTUP, SETTLE, || {
+                let status = Command::new("taskkill")
+                    .args(["/PID", &self.pid().to_string()])
+                    .status()
+                    .map_err(|error| error.to_string())?;
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!("taskkill failed: {status}"))
+                }
+            })
+            .unwrap_or_else(|error| panic!("{error}"));
         }
 
         #[cfg(all(unix, not(target_os = "macos")))]
@@ -243,6 +273,11 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        eprintln!(
+            "GUI lifecycle trace ({}):\n{}",
+            self.trace.display(),
+            fs::read_to_string(&self.trace).unwrap_or_default()
+        );
         // Cleanup is by ownership only. If the app is somehow still there, it
         // is still our unreaped child, so this stays exact.
         let _ = self.child.kill();
@@ -337,8 +372,11 @@ fn quitting_the_app_stops_the_backend() {
     // backend that kept serving.
     assert!(
         exit.is_some(),
-        "the app never exited after being asked to quit — either the quit was \
-         not delivered or the app hung on its way out"
+        "the app never exited after being asked to quit; observed phase: {}",
+        artifact_probe::close_progress(
+            &fs::read_to_string(&app.trace).unwrap_or_default(),
+            app.pid()
+        )
     );
     assert!(
         stopped_serving,
@@ -446,4 +484,108 @@ fn a_child_that_exits_reports_its_code() {
         Some(3),
         "an exited child must report its code"
     );
+}
+
+// Kept outside cfg(windows) so the exact Windows driver's handshake can be
+// tested without starting, signalling, or terminating any OS process.
+#[cfg(any(windows, test))]
+fn request_quit_when_ready(
+    trace: &std::path::Path,
+    pid: u32,
+    ready_timeout: Duration,
+    ack_timeout: Duration,
+    request: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    wait_for_gui_event(trace, pid, "main-window-ready", ready_timeout)?;
+    request()?;
+    wait_for_gui_event(trace, pid, "close-requested", ack_timeout)
+}
+
+#[cfg(any(windows, test))]
+fn wait_for_gui_event(
+    trace: &std::path::Path,
+    pid: u32,
+    event: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let contents =
+            fs::read_to_string(trace).map_err(|e| format!("cannot read GUI trace: {e}"))?;
+        if artifact_probe::contains(&contents, pid, event) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "GUI event {event} not observed: {}; trace: {contents}",
+                artifact_probe::close_progress(&contents, pid)
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod quit_handshake_tests {
+    use super::*;
+    fn fixture(run: impl FnOnce(&std::path::Path)) {
+        let path = std::env::temp_dir().join(format!(
+            "quit-trace-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, "7 backend-ready\n").unwrap();
+        run(&path);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn backend_listening_does_not_license_a_gui_quit_request() {
+        fixture(|trace| {
+            let mut calls = 0;
+            let result = request_quit_when_ready(trace, 7, Duration::ZERO, Duration::ZERO, || {
+                calls += 1;
+                Ok(())
+            });
+            assert_eq!(calls, 0, "must not send quit before main-window-ready");
+            assert!(result.unwrap_err().contains("GUI_NOT_READY"));
+        });
+    }
+
+    #[test]
+    fn successful_driver_without_close_event_is_not_delivery() {
+        fixture(|trace| {
+            fs::write(trace, "7 main-window-ready\n").unwrap();
+            let mut calls = 0;
+            let result = request_quit_when_ready(trace, 7, Duration::ZERO, Duration::ZERO, || {
+                calls += 1;
+                Ok(())
+            });
+            assert_eq!(calls, 1);
+            assert!(result.unwrap_err().contains("GUI_READY_NO_CLOSE_EVENT"));
+        });
+    }
+
+    #[test]
+    fn delivered_close_is_acknowledged_but_not_mistaken_for_process_exit() {
+        fixture(|trace| {
+            fs::write(trace, "7 main-window-ready\n").unwrap();
+            request_quit_when_ready(trace, 7, Duration::ZERO, Duration::ZERO, || {
+                fs::write(
+                    trace,
+                    "7 main-window-ready\n7 close-requested\n7 stop-backend-start\n",
+                )
+                .unwrap();
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(
+                artifact_probe::close_progress(&fs::read_to_string(trace).unwrap(), 7),
+                "SHUTDOWN_ENTERED_NOT_RETURNED"
+            );
+        });
+    }
 }
