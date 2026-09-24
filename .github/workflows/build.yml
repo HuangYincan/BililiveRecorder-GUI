@@ -64,11 +64,11 @@ jobs:
       # Debian's Package field. Keep its old ASCII identity for DEB only, but
       # emit the requested desktop Name from the pinned template. AppImage uses
       # the real (Unicode) productName and must be built separately.
-      - name: Build stable-identity DEB with branded desktop entry
+      - name: Build stable-identity DEB and RPM with branded desktop entries
         if: matrix.platform == 'ubuntu-22.04'
         run: >-
-          npm run tauri build -- -vv --target ${{ matrix.target }} --bundles deb
-          --config '{"productName":"BililiveRecorder GUI","bundle":{"createUpdaterArtifacts":false,"linux":{"deb":{"desktopTemplate":"branding/linux.desktop"}}}}'
+          npm run tauri build -- -vv --target ${{ matrix.target }} --bundles deb,rpm
+          --config '{"productName":"BililiveRecorder GUI","bundle":{"createUpdaterArtifacts":false,"linux":{"deb":{"desktopTemplate":"branding/linux.desktop"},"rpm":{"desktopTemplate":"branding/linux.desktop"}}}}'
       - name: Build branded AppImage
         if: matrix.platform == 'ubuntu-22.04'
         run: >-

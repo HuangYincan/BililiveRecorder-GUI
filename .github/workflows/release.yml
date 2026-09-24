@@ -133,7 +133,7 @@ jobs:
           updaterJsonPreferNsis: true
           args: -vv --target ${{ matrix.target }}
 
-      - name: Publish stable-identity DEB to draft release
+      - name: Publish stable-identity DEB and RPM to draft release
         if: matrix.platform == 'ubuntu-22.04'
         uses: tauri-apps/tauri-action@v0
         env:
@@ -151,8 +151,8 @@ jobs:
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
           args: >-
-            -vv --target ${{ matrix.target }} --bundles deb
-            --config '{"productName":"BililiveRecorder GUI","bundle":{"linux":{"deb":{"desktopTemplate":"branding/linux.desktop"}}}}'
+            -vv --target ${{ matrix.target }} --bundles deb,rpm
+            --config '{"productName":"BililiveRecorder GUI","bundle":{"linux":{"deb":{"desktopTemplate":"branding/linux.desktop"},"rpm":{"desktopTemplate":"branding/linux.desktop"}}}}'
 
       - name: Publish branded AppImage to the same draft release
         if: matrix.platform == 'ubuntu-22.04'
