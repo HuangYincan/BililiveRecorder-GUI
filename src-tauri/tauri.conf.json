@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "BililiveRecorder GUI",
+  "productName": "Mikufans录播姬",
   "version": "2.20.1",
   "identifier": "org.danmuji.bililiverecorder-gui",
   "build": {
@@ -24,14 +24,24 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["sidecar/**/*"],
+    "resources": [
+      "sidecar/**/*"
+    ],
     "license": "GPL-3.0-only",
-    "shortDescription": "跨平台录播姬桌面端",
+    "shortDescription": "Mikufans录播姬跨平台桌面端",
     "longDescription": "启动后自动运行官方 BililiveRecorder CLI，并在唯一主窗口中直接显示其内嵌官方 WebUI。",
     "category": "Utility",
     "copyright": "Copyright © 2026 HuangYincan",
     "macOS": {
       "minimumSystemVersion": "10.15"
+    },
+    "windows": {
+      "wix": {
+        "upgradeCode": "3a5e8872-ebd5-524f-9fe9-825771b0859b"
+      },
+      "nsis": {
+        "template": "branding/installer.nsi"
+      }
     }
   },
   "plugins": {

@@ -26,7 +26,7 @@ test('full macOS verification confines the CLI to the .app and compares exact co
   const projectRoot = mkdtempSync(join(tmpdir(), 'bililive-mac-package-'));
   const target = 'aarch64-apple-darwin';
   const macos = join(projectRoot, 'src-tauri', 'target', target, 'release', 'bundle', 'macos');
-  const app = join(macos, 'BililiveRecorder GUI.app');
+  const app = join(macos, 'Mikufans录播姬.app');
   const resources = join(app, 'Contents', 'Resources', 'sidecar', target);
   const outside = join(macos, 'outside-any-app', 'sidecar', target);
   const cli = join(resources, 'BililiveRecorder.Cli');

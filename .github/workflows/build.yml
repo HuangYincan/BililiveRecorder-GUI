@@ -43,6 +43,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xauth xvfb
       - run: npm ci
+      - name: Verify official white-background branding and stable update identity
+        run: npm run brand:verify
       - run: npm run desktop:version-test
       - name: Test package verifier against cross-platform fixtures
         run: node --test scripts/verify-packaged-sidecar.test.mjs
@@ -60,6 +62,50 @@ jobs:
       - name: Smoke-test CLI executable extracted from the built desktop package
         timeout-minutes: 12
         run: npm run bundle:smoke
+      - name: Verify macOS bundle name and stable identifier
+        if: startsWith(matrix.platform, 'macos-26')
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="src-tauri/target/${{ matrix.target }}/release/bundle/macos/Mikufans录播姬.app"
+          test -f "$app/Contents/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$app/Contents/Info.plist")" = 'Mikufans录播姬'
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = 'org.danmuji.bililiverecorder-gui'
+      - name: Verify Linux DEB desktop name and stable package identity
+        if: matrix.platform == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          set -euo pipefail
+          deb=$(find "src-tauri/target/${{ matrix.target }}/release/bundle/deb" -name '*_amd64.deb' -print -quit)
+          test -n "$deb"
+          test "$(dpkg-deb -f "$deb" Package)" = 'bililive-recorder-gui'
+          mkdir -p "$RUNNER_TEMP/brand-check"
+          dpkg-deb --extract "$deb" "$RUNNER_TEMP/brand-check"
+          desktop=$(find "$RUNNER_TEMP/brand-check/usr/share/applications" -name '*.desktop' -print -quit)
+          test -n "$desktop"
+          grep -Fx 'Name=Mikufans录播姬' "$desktop"
+      - name: Verify Windows installers display name and legacy MSI UpgradeCode
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = Get-ChildItem "src-tauri/target/${{ matrix.target }}/release/bundle/msi" -Filter '*.msi' | Select-Object -First 1
+          if (-not $msi) { throw 'MSI missing' }
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $database = $installer.OpenDatabase($msi.FullName, 0)
+          function Get-MsiProperty($property) {
+            $view = $database.OpenView("SELECT ``Value`` FROM ``Property`` WHERE ``Property`` = '$property'")
+            $view.Execute()
+            $record = $view.Fetch()
+            if (-not $record) { throw "Missing MSI property $property" }
+            return $record.StringData(1)
+          }
+          if ((Get-MsiProperty 'ProductName') -ne 'Mikufans录播姬') { throw 'MSI product name mismatch' }
+          if ((Get-MsiProperty 'UpgradeCode').Trim('{}').ToLowerInvariant() -ne '3a5e8872-ebd5-524f-9fe9-825771b0859b') {
+            throw 'MSI UpgradeCode changed: old MSI updates would not be recognized'
+          }
+          $nsis = Get-ChildItem "src-tauri/target/${{ matrix.target }}/release/bundle/nsis" -Filter '*.exe' | Select-Object -First 1
+          if (-not $nsis -or $nsis.VersionInfo.ProductName -ne 'Mikufans录播姬') { throw 'NSIS installer display name mismatch' }
       - name: Install DMG and verify artifact lifecycle
         if: startsWith(matrix.platform, 'macos-26')
         shell: bash
@@ -68,11 +114,11 @@ jobs:
           dmg=$(find "src-tauri/target/${{ matrix.target }}/release/bundle/dmg" -name '*.dmg' -print -quit)
           test -n "$dmg"
           mountpoint="$RUNNER_TEMP/bililive-recorder-dmg"
-          installed_app="$RUNNER_TEMP/BililiveRecorder GUI.app"
+          installed_app="$RUNNER_TEMP/Mikufans录播姬.app"
           mkdir -p "$mountpoint"
           hdiutil attach -nobrowse -readonly -mountpoint "$mountpoint" "$dmg"
           trap 'hdiutil detach "$mountpoint" || true' EXIT
-          ditto "$mountpoint/BililiveRecorder GUI.app" "$installed_app"
+          ditto "$mountpoint/Mikufans录播姬.app" "$installed_app"
           hdiutil detach "$mountpoint"
           trap - EXIT
 
@@ -126,6 +172,54 @@ jobs:
           xvfb-run -a cargo test --manifest-path src-tauri/Cargo.toml --test artifact_lifecycle killing_the_app_stops_the_backend -- --ignored --exact --nocapture 2>&1 | tee "$BILILIVE_ARTIFACT_EVIDENCE_DIR/kill-test.log"
           test -s "$BILILIVE_ARTIFACT_CLI_LOG"
           cp "$BILILIVE_ARTIFACT_CLI_LOG" "$BILILIVE_ARTIFACT_EVIDENCE_DIR/kill-cli.log"
+      - name: Verify old NSIS installation updates in place on disposable runner
+        if: matrix.platform == 'windows-latest'
+        timeout-minutes: 12
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $oldAssetDir = Join-Path $env:RUNNER_TEMP 'old-nsis'
+          $installDir = Join-Path $env:RUNNER_TEMP 'branding-upgrade-fixture'
+          New-Item -ItemType Directory -Force -Path $oldAssetDir | Out-Null
+          gh release download app-v2.20.1 --pattern 'BililiveRecorder.GUI_2.20.1_x64-setup.exe' --dir $oldAssetDir
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot obtain the previously published installer' }
+          $oldInstaller = Get-ChildItem $oldAssetDir -Filter '*.exe' | Select-Object -First 1
+          $newInstaller = Get-ChildItem "src-tauri/target/${{ matrix.target }}/release/bundle/nsis" -Filter '*.exe' | Select-Object -First 1
+          if (-not $oldInstaller -or -not $newInstaller) { throw 'Old or new NSIS installer not found' }
+          $oldRegistry = @(
+            'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\BililiveRecorder GUI',
+            'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\BililiveRecorder GUI'
+          )
+          try {
+            $previous = Start-Process -FilePath $oldInstaller.FullName -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru
+            if ($previous.ExitCode -ne 0) { throw "Old NSIS install failed: $($previous.ExitCode)" }
+            $found = @($oldRegistry | Where-Object { Test-Path -LiteralPath $_ })
+            if ($found.Count -ne 1) { throw "Expected one old NSIS uninstall key, found $($found.Count)" }
+            $oldKey = Get-ItemProperty -LiteralPath $found[0]
+            if ($oldKey.DisplayName -ne 'BililiveRecorder GUI') { throw 'Old installer identity not observed' }
+            $next = Start-Process -FilePath $newInstaller.FullName -ArgumentList @('/S', '/UPDATE', "/D=$installDir") -Wait -PassThru
+            if ($next.ExitCode -ne 0) { throw "Branded NSIS update failed: $($next.ExitCode)" }
+            $updated = Get-ItemProperty -LiteralPath $found[0]
+            if ($updated.DisplayName -ne 'Mikufans录播姬') { throw 'Old install did not adopt the new display name' }
+            if ((Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Mikufans录播姬') -or
+                (Test-Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Mikufans录播姬')) {
+              throw 'A side-by-side NSIS uninstall key was created'
+            }
+            $installedBinary = Join-Path $installDir 'bililive-recorder-gui.exe'
+            $builtBinary = "src-tauri/target/${{ matrix.target }}/release/bililive-recorder-gui.exe"
+            if (-not (Test-Path $installedBinary) -or (Get-FileHash $installedBinary).Hash -ne (Get-FileHash $builtBinary).Hash) {
+              throw 'Old install path was not replaced with this build'
+            }
+            Write-Output "Old NSIS identity retained and updated in place: $($found[0])"
+          } finally {
+            $uninstaller = Join-Path $installDir 'uninstall.exe'
+            if (Test-Path $uninstaller) {
+              $cleanup = Start-Process -FilePath $uninstaller -ArgumentList @('/S', '/UPDATE') -Wait -PassThru
+              if ($cleanup.ExitCode -ne 0) { Write-Warning "Fixture uninstall failed: $($cleanup.ExitCode)" }
+            }
+          }
       - name: Install MSI and verify artifact lifecycle
         if: matrix.platform == 'windows-latest'
         timeout-minutes: 25

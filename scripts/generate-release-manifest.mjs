@@ -20,15 +20,27 @@ const releaseTag = `app-v${packageJson.version}`;
 const assets = new Set(
   JSON.parse(readFileSync(assetsPath, 'utf8')).assets.map((asset) => asset.name),
 );
-const platformAssets = {
-  'darwin-aarch64': 'BililiveRecorder.GUI_aarch64.app.tar.gz',
-  'darwin-x86_64': 'BililiveRecorder.GUI_x64.app.tar.gz',
-  'linux-x86_64': `BililiveRecorder.GUI_${packageJson.version}_amd64.AppImage`,
-  'windows-x86_64': `BililiveRecorder.GUI_${packageJson.version}_x64-setup.exe`,
+const productName = JSON.parse(
+  readFileSync(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8'),
+).productName;
+// Product-name changes also change Tauri's asset filenames. Require the
+// CURRENT branded prefix, not a leftover asset from an earlier shell release.
+const prefixes = [productName, productName.replaceAll(' ', '.')];
+const platformSuffixes = {
+  'darwin-aarch64': '_aarch64.app.tar.gz',
+  'darwin-x86_64': '_x64.app.tar.gz',
+  'linux-x86_64': `_${packageJson.version}_amd64.AppImage`,
+  'windows-x86_64': `_${packageJson.version}_x64-setup.exe`,
 };
 
 const platforms = Object.fromEntries(
-  Object.entries(platformAssets).map(([platform, assetName]) => {
+  Object.entries(platformSuffixes).map(([platform, suffix]) => {
+    const candidates = [...assets].filter((name) =>
+      prefixes.some((prefix) => name.startsWith(prefix)) && name.endsWith(suffix));
+    if (candidates.length !== 1) {
+      throw new Error(`Expected exactly one ${productName} ${platform} updater, found ${candidates.length}`);
+    }
+    const assetName = candidates[0];
     const signatureName = `${assetName}.sig`;
     if (!assets.has(assetName) || !assets.has(signatureName)) {
       throw new Error(`${platform} updater asset or signature is missing: ${assetName}`);
@@ -44,7 +56,7 @@ const platforms = Object.fromEntries(
       platform,
       {
         signature,
-        url: `https://github.com/${repository}/releases/download/${releaseTag}/${assetName}`,
+        url: `https://github.com/${repository}/releases/download/${releaseTag}/${encodeURIComponent(assetName)}`,
       },
     ];
   }),
