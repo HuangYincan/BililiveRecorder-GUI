@@ -1,0 +1,3 @@
+# Keep the byte-pinned official SVG and reproducibly derived icon source LF on Windows.
+src-tauri/branding/*.svg text eol=lf
+src-tauri/branding/*.nsi text eol=lf
