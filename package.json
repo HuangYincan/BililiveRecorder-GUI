@@ -1,7 +1,7 @@
 {
   "name": "bililive-recorder-gui",
   "private": true,
-  "version": "2.20.1",
+  "version": "2.20.2",
   "type": "module",
   "scripts": {
     "build": "node scripts/check-no-custom-ui.mjs",
