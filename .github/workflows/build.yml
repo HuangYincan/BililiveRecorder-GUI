@@ -221,6 +221,10 @@ jobs:
             if ($found.Count -ne 1) { throw "Expected one old NSIS uninstall key, found $($found.Count)" }
             $oldKey = Get-ItemProperty -LiteralPath $found[0]
             if ($oldKey.DisplayName -ne 'BililiveRecorder GUI') { throw 'Old installer identity not observed' }
+            $installedBinary = Join-Path $installDir 'bililive-recorder-gui.exe'
+            if (-not (Test-Path $installedBinary)) { throw 'Old install has no executable' }
+            $oldHash = (Get-FileHash $installedBinary).Hash
+            $oldBinaryName = (Get-Item $installedBinary).VersionInfo.ProductName
             $next = Start-Process -FilePath $newInstaller.FullName -ArgumentList @('/S', '/UPDATE', "/D=$installDir") -Wait -PassThru
             if ($next.ExitCode -ne 0) { throw "Branded NSIS update failed: $($next.ExitCode)" }
             $updated = Get-ItemProperty -LiteralPath $found[0]
@@ -229,20 +233,20 @@ jobs:
                 (Test-Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Mikufans录播姬')) {
               throw 'A side-by-side NSIS uninstall key was created'
             }
-            $installedBinary = Join-Path $installDir 'bililive-recorder-gui.exe'
-            $builtBinary = "src-tauri/target/${{ matrix.target }}/release/bililive-recorder-gui.exe"
             $previousLocation = [string]$oldKey.InstallLocation
             $updatedLocation = [string]$updated.InstallLocation
             $installedHash = if (Test-Path $installedBinary) { (Get-FileHash $installedBinary).Hash } else { '<missing>' }
-            $builtHash = if (Test-Path $builtBinary) { (Get-FileHash $builtBinary).Hash } else { '<missing>' }
+            $updatedBinaryName = if (Test-Path $installedBinary) { (Get-Item $installedBinary).VersionInfo.ProductName } else { '<missing>' }
             Write-Output "Old location=$previousLocation; updated location=$updatedLocation; requested=$installDir"
-            Write-Output "Installed exe=$installedBinary hash=$installedHash; built exe=$builtBinary hash=$builtHash"
-            if ((Test-Path $installDir) -and ($installedHash -ne $builtHash)) {
-              Get-ChildItem -LiteralPath $installDir -Force | Select-Object Name,Length,LastWriteTimeUtc | Format-Table | Out-String | Write-Output
-            }
+            Write-Output "Old exe hash=$oldHash name=$oldBinaryName; installed hash=$installedHash name=$updatedBinaryName"
+            # The compiled target EXE and the EXE packed by NSIS can differ
+            # after bundler resource stamping; comparing those hashes gave a
+            # false failure. Assert actual old->new binary replacement and the
+            # installed executable's new embedded name instead.
             if ($updatedLocation.Trim('"') -ne $previousLocation.Trim('"') -or
-                $updatedLocation.Trim('"') -ne $installDir -or $installedHash -ne $builtHash) {
-              throw 'Old install path was not replaced in place with this build'
+                $updatedLocation.Trim('"') -ne $installDir -or
+                $oldHash -eq $installedHash -or $updatedBinaryName -ne 'Mikufans录播姬') {
+              throw 'Old NSIS executable was not upgraded in place to the branded build'
             }
             Write-Output "Old NSIS identity retained and updated in place: $($found[0])"
           } finally {
