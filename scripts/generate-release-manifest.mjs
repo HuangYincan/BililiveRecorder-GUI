@@ -1,3 +1,4 @@
+import { releaseAssetNames } from './release-asset-names.mjs';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -20,22 +21,15 @@ const releaseTag = `app-v${packageJson.version}`;
 const assets = new Set(
   JSON.parse(readFileSync(assetsPath, 'utf8')).assets.map((asset) => asset.name),
 );
-const productName = JSON.parse(
-  readFileSync(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8'),
-).productName;
-// Asset identity is exact: a uniquely named impostor must not pass.
-const platformSuffixes = {
-  'darwin-aarch64': '_aarch64.app.tar.gz',
-  'darwin-x86_64': '_x64.app.tar.gz',
-  'linux-x86_64': `_${packageJson.version}_amd64.AppImage`,
-  'windows-x86_64': `_${packageJson.version}_x64-setup.exe`,
-};
+// This is a distribution filename, not the Unicode application display name.
+// The action's pinned ASCII upload pattern and the draft-asset gate use the
+// same explicit platform/version mapping; an impostor cannot be selected.
+const expected = releaseAssetNames(packageJson.version).updater;
 
 const platforms = Object.fromEntries(
-  Object.entries(platformSuffixes).map(([platform, suffix]) => {
-    const assetName = `${productName}${suffix}`;
+  Object.entries(expected).map(([platform, assetName]) => {
     if (!assets.has(assetName)) {
-      throw new Error(`Expected exactly one ${productName} ${platform} updater, found 0`);
+      throw new Error(`Expected exact ${assetName} ${platform} updater, found 0`);
     }
     const signatureName = `${assetName}.sig`;
     if (!assets.has(assetName) || !assets.has(signatureName)) {

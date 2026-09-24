@@ -115,7 +115,8 @@ jobs:
         run: |
           test ! -e src-tauri/sidecar/${{ matrix.target }}/libcoreclrtraceptprovider.so
           src-tauri/sidecar/${{ matrix.target }}/BililiveRecorder.Cli --version
-      - uses: tauri-apps/tauri-action@v0
+      # Fixed upstream action: getAssetName uses [version]/[platform]/[arch]/[setup]/[ext].
+      - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5
         if: matrix.platform != 'ubuntu-22.04'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -128,6 +129,7 @@ jobs:
             Upstream release metadata is recorded in `upstream.json`.
           releaseDraft: true
           prerelease: false
+          assetNamePattern: MikufansRecorder_[version]_[platform]_[arch][setup][ext]
           retryAttempts: 3
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
@@ -135,7 +137,7 @@ jobs:
 
       - name: Publish stable-identity DEB and RPM to draft release
         if: matrix.platform == 'ubuntu-22.04'
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -147,6 +149,7 @@ jobs:
             Upstream release metadata is recorded in `upstream.json`.
           releaseDraft: true
           prerelease: false
+          assetNamePattern: MikufansRecorder_[version]_[platform]_[arch][setup][ext]
           retryAttempts: 3
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
@@ -156,7 +159,7 @@ jobs:
 
       - name: Publish branded AppImage to the same draft release
         if: matrix.platform == 'ubuntu-22.04'
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -168,6 +171,7 @@ jobs:
             Upstream release metadata is recorded in `upstream.json`.
           releaseDraft: true
           prerelease: false
+          assetNamePattern: MikufansRecorder_[version]_[platform]_[arch][setup][ext]
           retryAttempts: 3
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
@@ -239,6 +243,17 @@ jobs:
           node-version: 24
       - name: Test missing-tag creation and identity rejection without publishing
         run: node --test scripts/ensure-release-tag.test.mjs
+      # Read the actual GitHub draft AFTER upload (not generated test names),
+      # before creating a ref or making any release public. Missing, colliding,
+      # normalized or unexpectedly named assets fail closed.
+      - name: Verify actual uploaded ASCII asset names and build identity
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          mkdir -p release-audit
+          gh release view "app-v${VERSION}" --json tagName,isDraft,targetCommitish,assets > release-audit/draft.json
+          node scripts/verify-uploaded-release-assets.mjs release-audit/draft.json "$VERSION" "$GITHUB_SHA"
       - name: Establish new tag and verify it resolves to the actual build commit
         run: bash scripts/ensure-release-tag.sh
       - name: Validate updater assets and signatures
@@ -251,7 +266,7 @@ jobs:
           gh release download "app-v${VERSION}" --pattern '*.sig' --dir release-audit/signatures
           npm run release:manifest -- release-audit/assets.json release-audit/signatures release-audit/latest.json
           gh release upload "app-v${VERSION}" release-audit/latest.json --clobber
-          npm run release:validate -- release-audit/latest.json release-audit/assets.json
+          npm run release:validate -- release-audit/latest.json release-audit/assets.json release-audit/signatures
       - name: Publish draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -5,16 +5,11 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { releaseAssetNames } from './release-asset-names.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const version = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version;
-const productName = JSON.parse(readFileSync(join(root, 'src-tauri/tauri.conf.json'), 'utf8')).productName;
-const names = [
-  `${productName}_aarch64.app.tar.gz`,
-  `${productName}_x64.app.tar.gz`,
-  `${productName}_${version}_amd64.AppImage`,
-  `${productName}_${version}_x64-setup.exe`,
-];
+const names = Object.values(releaseAssetNames(version).updater);
 const sig = Buffer.from('untrusted comment: signature from tauri secret key\nfixture').toString('base64');
 
 function fixture(action) {
@@ -38,14 +33,14 @@ function fixture(action) {
   }
 }
 
-test('future updater references exactly the branded Unicode assets and signatures', () => {
+test('future updater references exact ASCII distribution assets and signatures', () => {
   fixture(({ outputPath, run }) => {
     run();
     const manifest = JSON.parse(readFileSync(outputPath, 'utf8'));
     assert.equal(manifest.version, version);
-    for (const entry of Object.values(manifest.platforms)) {
+    for (const [platform, entry] of Object.entries(manifest.platforms)) {
       assert.equal(entry.signature, sig);
-      assert.equal(entry.url.includes(encodeURIComponent(productName)), true);
+      assert.equal(decodeURIComponent(new URL(entry.url).pathname.split('/').at(-1)), releaseAssetNames(version).updater[platform]);
       assert.equal(entry.url.includes('/app-v' + version + '/'), true);
     }
   });
@@ -54,20 +49,20 @@ test('future updater references exactly the branded Unicode assets and signature
 test('old-product assets and a unique false-name asset fail closed', () => {
   fixture(({ assets, run }) => {
     assets[0].name = 'BililiveRecorder.GUI_aarch64.app.tar.gz';
-    assert.throws(run, /Expected exactly one/);
+    assert.throws(run, /Expected exact/);
   });
   // This must be a fully well-formed wrong candidate (including its .sig
   // asset and local signature); otherwise the old, loose startsWith matcher
   // would reject for a missing signature and this test would pass accidentally.
   for (const [index, wrongName] of [
-    [0, `${productName}.WRONG_aarch64.app.tar.gz`],
-    [4, `${productName}.WRONG_${version}_amd64.AppImage`],
+    [0, `MikufansRecorder.WRONG_${version}_darwin_aarch64.app.tar.gz`],
+    [4, `MikufansRecorder.WRONG_${version}_linux_amd64.AppImage`],
   ]) {
     fixture(({ assets, signatureDir, run }) => {
       assets[index].name = wrongName;
       assets[index + 1].name = `${wrongName}.sig`;
       writeFileSync(join(signatureDir, `${wrongName}.sig`), sig);
-      assert.throws(run, /Expected exactly one/);
+      assert.throws(run, /Expected exact/);
     });
   }
 });

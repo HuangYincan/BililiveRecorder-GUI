@@ -1,7 +1,7 @@
 {
   "name": "bililive-recorder-gui",
   "private": true,
-  "version": "2.20.2",
+  "version": "2.20.3",
   "type": "module",
   "scripts": {
     "build": "node scripts/check-no-custom-ui.mjs",
@@ -16,7 +16,7 @@
     "desktop:dev": "npm run sidecar:prepare && tauri dev",
     "desktop:build": "npm run sidecar:prepare && tauri build",
     "brand:icons": "node scripts/prepare-brand-svg.mjs && tauri icon src-tauri/branding/icon-white.svg --output src-tauri/icons && node scripts/canonicalize-icns.mjs",
-    "brand:verify": "node scripts/verify-branding.mjs && node --test scripts/generate-release-manifest.test.mjs",
+    "brand:verify": "node scripts/verify-branding.mjs && node --test scripts/generate-release-manifest.test.mjs scripts/release-asset-names.test.mjs scripts/validate-release.test.mjs",
     "check": "npm run build && cargo check --manifest-path src-tauri/Cargo.toml && cargo test --manifest-path src-tauri/Cargo.toml"
   },
   "dependencies": {},
