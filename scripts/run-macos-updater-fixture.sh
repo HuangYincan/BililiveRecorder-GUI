@@ -22,6 +22,6 @@ npm run tauri -- build --target "$TAURI_TARGET_TRIPLE" --bundles app --config '{
 new_app="src-tauri/target/$TAURI_TARGET_TRIPLE/release/bundle/macos/Mikufans录播姬.app"
 archive="$fixture/Mikufans录播姬.app.tar.gz"
 COPYFILE_DISABLE=1 tar -czf "$archive" -C "$(dirname "$new_app")" "$(basename "$new_app")"
-npx tauri signer sign --private-key-path "$fixture/updater.key" --app-version "$(node -p "require('./package.json').version")" "$archive" > /dev/null
+npx tauri signer sign --password '' --private-key-path "$fixture/updater.key" --app-version "$(node -p "require('./package.json').version")" "$archive" > /dev/null
 
 python3 scripts/verify-macos-updater-fixture.py "$new_app" "$archive" "$archive.sig" "$old_source" "$fixture" "$fixture/updater.key.pub" "$(node -p "require('./package.json').version")" "${TAURI_TARGET_TRIPLE%%-apple-darwin}"
