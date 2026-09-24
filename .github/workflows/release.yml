@@ -195,6 +195,10 @@ jobs:
           desktop=$(find "$RUNNER_TEMP/brand-check/usr/share/applications" -name '*.desktop' -print -quit)
           test -n "$desktop"
           grep -Fx 'Name=Mikufans录播姬' "$desktop"
+          rpm=$(find "src-tauri/target/${{ matrix.target }}/release/bundle/rpm" -name '*.rpm' -print -quit)
+          test -n "$rpm"
+          test "$(rpm -qp --qf '%{NAME}' "$rpm")" = 'bililive-recorder-gui'
+          test "$(rpm -qp --qf '%{SUMMARY}' "$rpm")" = 'Mikufans录播姬跨平台桌面端'
       - name: Verify Windows installers display name and legacy MSI UpgradeCode
         if: matrix.platform == 'windows-latest'
         shell: pwsh

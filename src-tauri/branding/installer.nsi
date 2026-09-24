@@ -931,8 +931,16 @@ Function CreateOrUpdateStartMenuShortcut
   !insertmacro IsShortcutTarget "$SMPROGRAMS\${LEGACYPRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
   Pop $0
   ${If} $0 = 1
-    Delete "$SMPROGRAMS\${LEGACYPRODUCTNAME}.lnk"
-    CreateShortcut "$SMPROGRAMS\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
+    ; An existing new-name link may belong to another app: never overwrite it.
+    ; Rename is one filesystem operation; only after it succeeds does the old
+    ; name disappear. On failure the original link remains intact.
+    ${If} ${FileExists} "$SMPROGRAMS\${PRODUCTNAME}.lnk"
+      Return
+    ${EndIf}
+    ClearErrors
+    Rename "$SMPROGRAMS\${LEGACYPRODUCTNAME}.lnk" "$SMPROGRAMS\${PRODUCTNAME}.lnk"
+    IfErrors 0 +2
+      Return
     !insertmacro SetLnkAppUserModelId "$SMPROGRAMS\${PRODUCTNAME}.lnk"
     StrCpy $R0 1
   ${EndIf}
@@ -965,10 +973,16 @@ Function CreateOrUpdateStartMenuShortcut
   ${EndIf}
 
   !if "${STARTMENUFOLDER}" != ""
+    ${If} ${FileExists} "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk"
+      Return
+    ${EndIf}
     CreateDirectory "$SMPROGRAMS\$AppStartMenuFolder"
     CreateShortcut "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
     !insertmacro SetLnkAppUserModelId "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk"
   !else
+    ${If} ${FileExists} "$SMPROGRAMS\${PRODUCTNAME}.lnk"
+      Return
+    ${EndIf}
     CreateShortcut "$SMPROGRAMS\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
     !insertmacro SetLnkAppUserModelId "$SMPROGRAMS\${PRODUCTNAME}.lnk"
   !endif
@@ -980,8 +994,13 @@ Function CreateOrUpdateDesktopShortcut
   !insertmacro IsShortcutTarget "$DESKTOP\${LEGACYPRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
   Pop $0
   ${If} $0 = 1
-    Delete "$DESKTOP\${LEGACYPRODUCTNAME}.lnk"
-    CreateShortcut "$DESKTOP\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
+    ${If} ${FileExists} "$DESKTOP\${PRODUCTNAME}.lnk"
+      Return
+    ${EndIf}
+    ClearErrors
+    Rename "$DESKTOP\${LEGACYPRODUCTNAME}.lnk" "$DESKTOP\${PRODUCTNAME}.lnk"
+    IfErrors 0 +2
+      Return
     !insertmacro SetLnkAppUserModelId "$DESKTOP\${PRODUCTNAME}.lnk"
     Return
   ${EndIf}
@@ -1004,6 +1023,9 @@ Function CreateOrUpdateDesktopShortcut
     ${EndIf}
   ${EndIf}
 
+  ${If} ${FileExists} "$DESKTOP\${PRODUCTNAME}.lnk"
+    Return
+  ${EndIf}
   CreateShortcut "$DESKTOP\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
   !insertmacro SetLnkAppUserModelId "$DESKTOP\${PRODUCTNAME}.lnk"
 FunctionEnd

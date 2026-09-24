@@ -23,9 +23,7 @@ const assets = new Set(
 const productName = JSON.parse(
   readFileSync(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8'),
 ).productName;
-// Product-name changes also change Tauri's asset filenames. Require the
-// CURRENT branded prefix, not a leftover asset from an earlier shell release.
-const prefixes = [productName, productName.replaceAll(' ', '.')];
+// Asset identity is exact: a uniquely named impostor must not pass.
 const platformSuffixes = {
   'darwin-aarch64': '_aarch64.app.tar.gz',
   'darwin-x86_64': '_x64.app.tar.gz',
@@ -35,12 +33,10 @@ const platformSuffixes = {
 
 const platforms = Object.fromEntries(
   Object.entries(platformSuffixes).map(([platform, suffix]) => {
-    const candidates = [...assets].filter((name) =>
-      prefixes.some((prefix) => name.startsWith(prefix)) && name.endsWith(suffix));
-    if (candidates.length !== 1) {
-      throw new Error(`Expected exactly one ${productName} ${platform} updater, found ${candidates.length}`);
+    const assetName = `${productName}${suffix}`;
+    if (!assets.has(assetName)) {
+      throw new Error(`Expected exactly one ${productName} ${platform} updater, found 0`);
     }
-    const assetName = candidates[0];
     const signatureName = `${assetName}.sig`;
     if (!assets.has(assetName) || !assets.has(signatureName)) {
       throw new Error(`${platform} updater asset or signature is missing: ${assetName}`);

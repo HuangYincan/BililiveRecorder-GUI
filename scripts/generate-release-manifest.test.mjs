@@ -26,7 +26,7 @@ function fixture(action) {
   const assets = names.flatMap((name) => [{ name }, { name: `${name}.sig` }]);
   for (const name of names) writeFileSync(join(signatureDir, `${name}.sig`), sig);
   try {
-    action({ assets, assetsPath, outputPath, run() {
+    action({ assets, assetsPath, signatureDir, outputPath, run() {
       writeFileSync(assetsPath, JSON.stringify({ assets }));
       const result = spawnSync(process.execPath, [join(root, 'scripts/generate-release-manifest.mjs'), assetsPath, signatureDir, outputPath],
         { cwd: root, env: { ...process.env, GITHUB_REPOSITORY: 'HuangYincan/BililiveRecorder-GUI' }, encoding: 'utf8' });
@@ -51,13 +51,23 @@ test('future updater references exactly the branded Unicode assets and signature
   });
 });
 
-test('old-product updater assets and ambiguous matching assets fail closed', () => {
+test('old-product assets and a unique false-name asset fail closed', () => {
   fixture(({ assets, run }) => {
     assets[0].name = 'BililiveRecorder.GUI_aarch64.app.tar.gz';
     assert.throws(run, /Expected exactly one/);
   });
-  fixture(({ assets, run }) => {
-    assets.push({ name: `${productName}.duplicate_${version}_amd64.AppImage` });
-    assert.throws(run, /Expected exactly one/);
-  });
+  // This must be a fully well-formed wrong candidate (including its .sig
+  // asset and local signature); otherwise the old, loose startsWith matcher
+  // would reject for a missing signature and this test would pass accidentally.
+  for (const [index, wrongName] of [
+    [0, `${productName}.WRONG_aarch64.app.tar.gz`],
+    [4, `${productName}.WRONG_${version}_amd64.AppImage`],
+  ]) {
+    fixture(({ assets, signatureDir, run }) => {
+      assets[index].name = wrongName;
+      assets[index + 1].name = `${wrongName}.sig`;
+      writeFileSync(join(signatureDir, `${wrongName}.sig`), sig);
+      assert.throws(run, /Expected exactly one/);
+    });
+  }
 });
