@@ -405,3 +405,30 @@ jobs:
           path: ${{ env.BILILIVE_ARTIFACT_EVIDENCE_DIR }}
           if-no-files-found: error
           overwrite: true
+
+  # Only this branding PR (or an explicit manual CI run) pays the additional
+  # disposable macOS test cost. No production key, release, tag or user data.
+  macos-brand-updater-fixture:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.head_ref == 'feat/official-icon-mikufans-name')
+    needs: build
+    runs-on: macos-26
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      TAURI_TARGET_TRIPLE: aarch64-apple-darwin
+      NO_STRIP: '1'
+      RUST_BACKTRACE: '1'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - run: npm ci
+      - name: Real signed updater old-name fixture and local endpoint
+        timeout-minutes: 50
+        run: bash scripts/run-macos-updater-fixture.sh
