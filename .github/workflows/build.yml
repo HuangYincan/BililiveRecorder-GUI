@@ -231,8 +231,18 @@ jobs:
             }
             $installedBinary = Join-Path $installDir 'bililive-recorder-gui.exe'
             $builtBinary = "src-tauri/target/${{ matrix.target }}/release/bililive-recorder-gui.exe"
-            if (-not (Test-Path $installedBinary) -or (Get-FileHash $installedBinary).Hash -ne (Get-FileHash $builtBinary).Hash) {
-              throw 'Old install path was not replaced with this build'
+            $previousLocation = [string]$oldKey.InstallLocation
+            $updatedLocation = [string]$updated.InstallLocation
+            $installedHash = if (Test-Path $installedBinary) { (Get-FileHash $installedBinary).Hash } else { '<missing>' }
+            $builtHash = if (Test-Path $builtBinary) { (Get-FileHash $builtBinary).Hash } else { '<missing>' }
+            Write-Output "Old location=$previousLocation; updated location=$updatedLocation; requested=$installDir"
+            Write-Output "Installed exe=$installedBinary hash=$installedHash; built exe=$builtBinary hash=$builtHash"
+            if ((Test-Path $installDir) -and ($installedHash -ne $builtHash)) {
+              Get-ChildItem -LiteralPath $installDir -Force | Select-Object Name,Length,LastWriteTimeUtc | Format-Table | Out-String | Write-Output
+            }
+            if ($updatedLocation.Trim('"') -ne $previousLocation.Trim('"') -or
+                $updatedLocation.Trim('"') -ne $installDir -or $installedHash -ne $builtHash) {
+              throw 'Old install path was not replaced in place with this build'
             }
             Write-Output "Old NSIS identity retained and updated in place: $($found[0])"
           } finally {
