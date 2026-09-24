@@ -114,7 +114,11 @@ if (icoFrames < 4) throw new Error('Windows ICO lacks size variants');
 const icns = readFileSync(join(iconRoot, 'icon.icns'));
 if (icns.toString('ascii', 0, 4) !== 'icns') throw new Error('Missing macOS ICNS');
 let icnsPngs = 0;
+let previousType = "";
 for (let at = 8; at < icns.length;) {
+  const type = icns.toString("ascii", at, at + 4);
+  if (type < previousType) throw new Error("ICNS resources not canonically ordered");
+  previousType = type;
   const size = icns.readUInt32BE(at + 4);
   if (size < 8) throw new Error('Invalid ICNS chunk');
   const png = icns.subarray(at + 8, at + size);
