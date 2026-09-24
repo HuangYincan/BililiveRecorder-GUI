@@ -60,7 +60,7 @@
 //! # Running it
 //!
 //! ```text
-//! BILILIVE_ARTIFACT_APP="/path/to/BililiveRecorder GUI.app/Contents/MacOS/bililive-recorder-gui" \
+//! BILILIVE_ARTIFACT_APP="/path/to/Mikufans录播姬.app/Contents/MacOS/bililive-recorder-gui" \
 //! BILILIVE_ARTIFACT_OK=1 \
 //!   cargo test --test artifact_lifecycle -- --ignored --test-threads 1
 //! ```
@@ -94,7 +94,7 @@ fn app_path() -> PathBuf {
     let raw = std::env::var_os("BILILIVE_ARTIFACT_APP").unwrap_or_else(|| {
         panic!(
             "set BILILIVE_ARTIFACT_APP to the app executable \
-             (…/BililiveRecorder GUI.app/Contents/MacOS/bililive-recorder-gui)"
+             (…/Mikufans录播姬.app/Contents/MacOS/bililive-recorder-gui)"
         )
     });
     let path = PathBuf::from(raw);
@@ -212,7 +212,7 @@ impl App {
             // against an app started from its bundle executable rather than by
             // `open`; if it silently does nothing the timeout below says so.
             let status = Command::new("osascript")
-                .args(["-e", "tell application \"BililiveRecorder GUI\" to quit"])
+                .args(["-e", "tell application \"Mikufans录播姬\" to quit"])
                 .status()
                 .expect("osascript should run");
             assert!(status.success(), "osascript could not ask the app to quit");

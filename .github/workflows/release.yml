@@ -104,6 +104,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
       - run: npm ci
+      - name: Verify official white-background branding and stable update identity
+        run: npm run brand:verify
       - name: Verify builder checkout is the approved commit
         shell: bash
         run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
@@ -114,11 +116,12 @@ jobs:
           test ! -e src-tauri/sidecar/${{ matrix.target }}/libcoreclrtraceptprovider.so
           src-tauri/sidecar/${{ matrix.target }}/BililiveRecorder.Cli --version
       - uses: tauri-apps/tauri-action@v0
+        if: matrix.platform != 'ubuntu-22.04'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: app-v__VERSION__
-          releaseName: "BililiveRecorder GUI v__VERSION__"
+          releaseName: "Mikufans录播姬 v__VERSION__"
           releaseBody: |
             This release bundles the matching official BililiveRecorder CLI and its embedded upstream WebUI.
 
@@ -129,6 +132,102 @@ jobs:
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
           args: -vv --target ${{ matrix.target }}
+
+      - name: Publish stable-identity DEB and RPM to draft release
+        if: matrix.platform == 'ubuntu-22.04'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: app-v__VERSION__
+          releaseName: "Mikufans录播姬 v__VERSION__"
+          releaseBody: |
+            This release bundles the matching official BililiveRecorder CLI and its embedded upstream WebUI.
+
+            Upstream release metadata is recorded in `upstream.json`.
+          releaseDraft: true
+          prerelease: false
+          retryAttempts: 3
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true
+          args: >-
+            -vv --target ${{ matrix.target }} --bundles deb,rpm
+            --config '{"productName":"BililiveRecorder GUI","bundle":{"linux":{"deb":{"desktopTemplate":"branding/linux.desktop"},"rpm":{"desktopTemplate":"branding/linux.desktop"}}}}'
+
+      - name: Publish branded AppImage to the same draft release
+        if: matrix.platform == 'ubuntu-22.04'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: app-v__VERSION__
+          releaseName: "Mikufans录播姬 v__VERSION__"
+          releaseBody: |
+            This release bundles the matching official BililiveRecorder CLI and its embedded upstream WebUI.
+
+            Upstream release metadata is recorded in `upstream.json`.
+          releaseDraft: true
+          prerelease: false
+          retryAttempts: 3
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true
+          args: -vv --target ${{ matrix.target }} --bundles appimage
+
+      - name: Verify macOS bundle name and stable identifier
+        if: startsWith(matrix.platform, 'macos-26')
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="src-tauri/target/${{ matrix.target }}/release/bundle/macos/Mikufans录播姬.app"
+          test -f "$app/Contents/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$app/Contents/Info.plist")" = 'Mikufans录播姬'
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = 'org.danmuji.bililiverecorder-gui'
+      - name: Verify Linux DEB desktop name and stable package identity
+        if: matrix.platform == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          set -euo pipefail
+          deb=$(find "src-tauri/target/${{ matrix.target }}/release/bundle/deb" -name '*_amd64.deb' -print -quit)
+          test -n "$deb"
+          test "$(dpkg-deb -f "$deb" Package)" = 'bililive-recorder-gui'
+          mkdir -p "$RUNNER_TEMP/brand-check"
+          dpkg-deb --extract "$deb" "$RUNNER_TEMP/brand-check"
+          desktop=$(find "$RUNNER_TEMP/brand-check/usr/share/applications" -name '*.desktop' -print -quit)
+          test -n "$desktop"
+          grep -Fx 'Name=Mikufans录播姬' "$desktop"
+          rpm=$(find "src-tauri/target/${{ matrix.target }}/release/bundle/rpm" -name '*.rpm' -print -quit)
+          test -n "$rpm"
+          test "$(rpm -qp --qf '%{NAME}' "$rpm")" = 'bililive-recorder-gui'
+          test "$(rpm -qp --qf '%{SUMMARY}' "$rpm")" = 'Mikufans录播姬跨平台桌面端'
+      - name: Verify Windows installers display name and legacy MSI UpgradeCode
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = Get-ChildItem "src-tauri/target/${{ matrix.target }}/release/bundle/msi" -Filter '*.msi' | Select-Object -First 1
+          if (-not $msi) { throw 'MSI missing' }
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $database = $installer.OpenDatabase($msi.FullName, 0)
+          function Get-MsiProperty($property) {
+            $view = $database.OpenView("SELECT ``Value`` FROM ``Property`` WHERE ``Property`` = '$property'")
+            $view.Execute()
+            $record = $view.Fetch()
+            if (-not $record) { throw "Missing MSI property $property" }
+            return $record.StringData(1)
+          }
+          if ((Get-MsiProperty 'ProductName') -ne 'Mikufans录播姬') { throw 'MSI product name mismatch' }
+          # WiX Product/@UpgradeCode is indexed in the MSI Upgrade table, not
+          # guaranteed to exist as a Property row. Query the actual upgrade
+          # relation; otherwise a null Property read falsely fails the build.
+          $upgradeView = $database.OpenView('SELECT `UpgradeCode` FROM `Upgrade`')
+          $upgradeView.Execute()
+          $upgradeCodes = @()
+          while ($row = $upgradeView.Fetch()) { $upgradeCodes += $row.StringData(1) }
+          if (-not ($upgradeCodes | Where-Object { $_.Trim('{}').ToLowerInvariant() -eq '3a5e8872-ebd5-524f-9fe9-825771b0859b' })) {
+            throw "Old MSI UpgradeCode absent from Upgrade table: $($upgradeCodes -join ', ')"
+          }
+          $nsis = Get-ChildItem "src-tauri/target/${{ matrix.target }}/release/bundle/nsis" -Filter '*.exe' | Select-Object -First 1
+          if (-not $nsis -or $nsis.VersionInfo.ProductName -ne 'Mikufans录播姬') { throw 'NSIS installer display name mismatch' }
 
   publish:
     needs: release

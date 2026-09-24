@@ -750,7 +750,7 @@ fn report_fatal(app: &tauri::AppHandle, message: &str) {
     }
     app.dialog()
         .message(message)
-        .title("BililiveRecorder")
+        .title("Mikufans录播姬")
         .kind(MessageDialogKind::Error)
         .blocking_show();
 }
@@ -766,7 +766,7 @@ fn report_warning(app: &tauri::AppHandle, message: &str) {
     eprintln!("bililive-recorder-gui: {message}");
     app.dialog()
         .message(message)
-        .title("BililiveRecorder")
+        .title("Mikufans录播姬")
         .kind(MessageDialogKind::Error)
         .show(|_| {});
 }
@@ -969,7 +969,7 @@ async fn check_for_updates(app: tauri::AppHandle) {
     let accepted = app
         .dialog()
         .message(format!(
-            "发现 BililiveRecorder GUI {}。更新包包含对应版本的官方 CLI 与内嵌 WebUI。",
+            "发现 Mikufans录播姬桌面壳 {} 更新。安装包内含官方 CLI 及其内嵌 WebUI。",
             update.version
         ))
         .title("发现更新")
@@ -1001,7 +1001,7 @@ async fn launch_main_window(app: tauri::AppHandle) -> Result<(), String> {
     let webui_url =
         url::Url::parse(&format!("{base_url}/ui/")).map_err(|error| error.to_string())?;
     let window = WebviewWindowBuilder::new(&app, "main", WebviewUrl::External(webui_url.clone()))
-        .title("BililiveRecorder")
+        .title("Mikufans录播姬")
         .inner_size(1280.0, 820.0)
         .min_inner_size(800.0, 560.0)
         .center()
@@ -1134,7 +1134,7 @@ pub fn run() {
             }
         })
         .build(tauri::generate_context!())
-        .expect("error while building BililiveRecorder GUI");
+        .expect("error while building Mikufans录播姬");
 
     app.run(|app, event| {
         match &event {
@@ -1243,10 +1243,10 @@ mod tests {
     #[test]
     fn parses_a_guardian_invocation() {
         let config = parse(&[
-            "/Applications/BililiveRecorder GUI.app/Contents/MacOS/bililive-recorder-gui",
+            "/Applications/Mikufans录播姬.app/Contents/MacOS/bililive-recorder-gui",
             GUARDIAN_FLAG,
             "--program",
-            "/Applications/BililiveRecorder GUI.app/Contents/Resources/sidecar/BililiveRecorder.Cli",
+            "/Applications/Mikufans录播姬.app/Contents/Resources/sidecar/BililiveRecorder.Cli",
             "--backend-arg",
             "run",
             "--backend-arg",
