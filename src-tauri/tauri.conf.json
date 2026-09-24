@@ -37,7 +37,8 @@
     },
     "windows": {
       "wix": {
-        "upgradeCode": "3a5e8872-ebd5-524f-9fe9-825771b0859b"
+        "upgradeCode": "3a5e8872-ebd5-524f-9fe9-825771b0859b",
+        "language": "zh-CN"
       },
       "nsis": {
         "template": "branding/installer.nsi"

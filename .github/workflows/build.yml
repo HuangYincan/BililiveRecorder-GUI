@@ -57,8 +57,23 @@ jobs:
       - name: Sidecar lifecycle regression tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
       - uses: tauri-apps/tauri-action@v0
+        if: matrix.platform != 'ubuntu-22.04'
         with:
           args: -vv --target ${{ matrix.target }} --config '{"bundle":{"createUpdaterArtifacts":false}}'
+      # Tauri derives Debian Package from productName; Unicode is invalid in
+      # Debian's Package field. Keep its old ASCII identity for DEB only, but
+      # emit the requested desktop Name from the pinned template. AppImage uses
+      # the real (Unicode) productName and must be built separately.
+      - name: Build stable-identity DEB with branded desktop entry
+        if: matrix.platform == 'ubuntu-22.04'
+        run: >-
+          npm run tauri build -- -vv --target ${{ matrix.target }} --bundles deb
+          --config '{"productName":"BililiveRecorder GUI","bundle":{"createUpdaterArtifacts":false,"linux":{"deb":{"desktopTemplate":"branding/linux.desktop"}}}}'
+      - name: Build branded AppImage
+        if: matrix.platform == 'ubuntu-22.04'
+        run: >-
+          npm run tauri build -- -vv --target ${{ matrix.target }} --bundles appimage
+          --config '{"bundle":{"createUpdaterArtifacts":false}}'
       - name: Smoke-test CLI executable extracted from the built desktop package
         timeout-minutes: 12
         run: npm run bundle:smoke

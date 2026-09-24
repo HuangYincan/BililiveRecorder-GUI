@@ -116,6 +116,7 @@ jobs:
           test ! -e src-tauri/sidecar/${{ matrix.target }}/libcoreclrtraceptprovider.so
           src-tauri/sidecar/${{ matrix.target }}/BililiveRecorder.Cli --version
       - uses: tauri-apps/tauri-action@v0
+        if: matrix.platform != 'ubuntu-22.04'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -131,6 +132,46 @@ jobs:
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
           args: -vv --target ${{ matrix.target }}
+
+      - name: Publish stable-identity DEB to draft release
+        if: matrix.platform == 'ubuntu-22.04'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: app-v__VERSION__
+          releaseName: "Mikufans录播姬 v__VERSION__"
+          releaseBody: |
+            This release bundles the matching official BililiveRecorder CLI and its embedded upstream WebUI.
+
+            Upstream release metadata is recorded in `upstream.json`.
+          releaseDraft: true
+          prerelease: false
+          retryAttempts: 3
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true
+          args: >-
+            -vv --target ${{ matrix.target }} --bundles deb
+            --config '{"productName":"BililiveRecorder GUI","bundle":{"linux":{"deb":{"desktopTemplate":"branding/linux.desktop"}}}}'
+
+      - name: Publish branded AppImage to the same draft release
+        if: matrix.platform == 'ubuntu-22.04'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: app-v__VERSION__
+          releaseName: "Mikufans录播姬 v__VERSION__"
+          releaseBody: |
+            This release bundles the matching official BililiveRecorder CLI and its embedded upstream WebUI.
+
+            Upstream release metadata is recorded in `upstream.json`.
+          releaseDraft: true
+          prerelease: false
+          retryAttempts: 3
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true
+          args: -vv --target ${{ matrix.target }} --bundles appimage
 
       - name: Verify macOS bundle name and stable identifier
         if: startsWith(matrix.platform, 'macos-26')

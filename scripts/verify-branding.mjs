@@ -23,8 +23,15 @@ if (config.productName !== 'Mikufans录播姬' || config.identifier !== 'org.dan
   throw new Error('Product name or existing updater/data identity changed unexpectedly');
 }
 if (config.version !== pkg.version) throw new Error('Desktop versions disagree');
+if (config.bundle.windows.wix.language !== 'zh-CN') {
+  throw new Error('MSI language/codepage must support the Chinese product name');
+}
 if (config.bundle.windows.wix.upgradeCode !== '3a5e8872-ebd5-524f-9fe9-825771b0859b') {
   throw new Error('MSI must retain the previously shipped WiX UpgradeCode');
+}
+const desktop = read('src-tauri/branding/linux.desktop').toString('utf8');
+if (!desktop.includes('Name=Mikufans录播姬\n')) {
+  throw new Error('Stable ASCII DEB package has no visible new app name');
 }
 const nsis = read('src-tauri/branding/installer.nsi').toString('utf8');
 for (const marker of [
