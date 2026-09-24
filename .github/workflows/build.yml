@@ -116,8 +116,15 @@ jobs:
             return $record.StringData(1)
           }
           if ((Get-MsiProperty 'ProductName') -ne 'Mikufans录播姬') { throw 'MSI product name mismatch' }
-          if ((Get-MsiProperty 'UpgradeCode').Trim('{}').ToLowerInvariant() -ne '3a5e8872-ebd5-524f-9fe9-825771b0859b') {
-            throw 'MSI UpgradeCode changed: old MSI updates would not be recognized'
+          # WiX Product/@UpgradeCode is indexed in the MSI Upgrade table, not
+          # guaranteed to exist as a Property row. Query the actual upgrade
+          # relation; otherwise a null Property read falsely fails the build.
+          $upgradeView = $database.OpenView('SELECT `UpgradeCode` FROM `Upgrade`')
+          $upgradeView.Execute()
+          $upgradeCodes = @()
+          while ($row = $upgradeView.Fetch()) { $upgradeCodes += $row.StringData(1) }
+          if (-not ($upgradeCodes | Where-Object { $_.Trim('{}').ToLowerInvariant() -eq '3a5e8872-ebd5-524f-9fe9-825771b0859b' })) {
+            throw "Old MSI UpgradeCode absent from Upgrade table: $($upgradeCodes -join ', ')"
           }
           $nsis = Get-ChildItem "src-tauri/target/${{ matrix.target }}/release/bundle/nsis" -Filter '*.exe' | Select-Object -First 1
           if (-not $nsis -or $nsis.VersionInfo.ProductName -ne 'Mikufans录播姬') { throw 'NSIS installer display name mismatch' }
