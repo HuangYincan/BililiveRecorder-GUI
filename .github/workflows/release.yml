@@ -236,6 +236,38 @@ jobs:
           gh release download "app-v${version}" --pattern "$name" --dir macos-release-audit
           test "$(shasum -a 256 "macos-release-audit/$name" | cut -d' ' -f1)" = "$(cat macos-release-audit/expected.sha)"
           bash scripts/verify-macos-release-dmg.sh "macos-release-audit/$name" "$TAURI_TARGET_TRIPLE"
+      # Real runtime check only on an authorized, disposable hosted runner;
+      # mocks and successful codesign alone cannot prove hardened .NET starts.
+      - name: Launch signed CLI and downloaded app on isolated macOS runner
+        if: startsWith(matrix.platform, 'macos-26')
+        shell: bash
+        run: |
+          set -euo pipefail
+          cli="src-tauri/sidecar/${TAURI_TARGET_TRIPLE}/BililiveRecorder.Cli"
+          expected=$(node -p "require('./upstream.json').version.replace(/^v/, '')")
+          output=$("$cli" --version)
+          printf '%s\n' "$output"
+          printf '%s\n' "$output" | grep -Fq " $expected"
+          version=$(node -p "require('./package.json').version")
+          case "$TAURI_TARGET_TRIPLE" in
+            aarch64-apple-darwin) arch=aarch64 ;;
+            x86_64-apple-darwin) arch=x64 ;;
+            *) exit 1 ;;
+          esac
+          dmg="macos-release-audit/MikufansRecorder_${version}_darwin_${arch}.dmg"
+          mountpoint="$RUNNER_TEMP/signed-app-dmg"
+          mkdir -p "$mountpoint"
+          hdiutil attach -readonly -nobrowse -noautoopen -mountpoint "$mountpoint" "$dmg"
+          trap 'hdiutil detach "$mountpoint" || true' EXIT
+          ditto "$mountpoint/Mikufans录播姬.app" "$RUNNER_TEMP/signed-app.app"
+          hdiutil detach "$mountpoint"
+          trap - EXIT
+          export BILILIVE_ARTIFACT_APP="$RUNNER_TEMP/signed-app.app/Contents/MacOS/bililive-recorder-gui"
+          export BILILIVE_ARTIFACT_OK=1
+          export BILILIVE_ARTIFACT_EVIDENCE_DIR="$RUNNER_TEMP/signed-app-runtime-evidence"
+          mkdir -p "$BILILIVE_ARTIFACT_EVIDENCE_DIR"
+          cargo test --manifest-path src-tauri/Cargo.toml --test artifact_lifecycle \
+            quitting_the_app_stops_the_backend -- --ignored --exact --nocapture
       - name: Verify macOS bundle name and stable identifier
         if: startsWith(matrix.platform, 'macos-26')
         shell: bash

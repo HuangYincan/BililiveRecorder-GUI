@@ -43,6 +43,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xauth xvfb
       - run: npm ci
+      - name: Test macOS release-gate failure injection without signing
+        if: startsWith(matrix.platform, 'macos-26')
+        shell: bash
+        run: bash scripts/test-macos-gate-scripts.sh
       - name: Verify official white-background branding and stable update identity
         run: npm run brand:verify
       - run: npm run desktop:version-test

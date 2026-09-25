@@ -18,16 +18,42 @@ case "$identity" in
   'Developer ID Application: '*) ;;
   *) echo 'Identity must be a Developer ID Application certificate' >&2; exit 2 ;;
 esac
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+entitlements="$script_dir/../src-tauri/branding/macos-cli.entitlements.plist"
+test -f "$entitlements"
+manifest=$(mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/sidecar-native-files-XXXXXX")
+embedded=$(mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/sidecar-entitlements-XXXXXX")
+trap 'rm -f "$manifest" "$embedded"' EXIT
+# Redirection belongs to a top-level command: an enumerator that writes a
+# partial list and then errors must NOT turn into a successful while loop.
+find "$root" -type f -print0 > "$manifest"
 seen=0
+cli_signed=0
 while IFS= read -r -d '' native; do
-  if file -b "$native" | grep -q '^Mach-O '; then
-    seen=$((seen + 1))
-    codesign --force --options runtime --timestamp --sign "$identity" "$native"
-    codesign --verify --strict --verbose=2 "$native"
-    info=$(codesign --display --verbose=4 "$native" 2>&1)
-    printf '%s\n' "$info" | grep -Fq 'Authority=Developer ID Application:'
-    printf '%s\n' "$info" | grep -Fxq "TeamIdentifier=$team"
+  if ! kind=$(file -b "$native"); then
+    echo "Cannot inspect native candidate: $native" >&2
+    exit 1
   fi
-done < <(find "$root" -type f -print0)
+  case "$kind" in
+    Mach-O\ *)
+      seen=$((seen + 1))
+      if [ "$native" = "$root/BililiveRecorder.Cli" ]; then
+        codesign --force --options runtime --timestamp --entitlements "$entitlements" --sign "$identity" "$native"
+      else
+        codesign --force --options runtime --timestamp --sign "$identity" "$native"
+      fi
+      codesign --verify --strict --verbose=2 "$native"
+      info=$(codesign --display --verbose=4 "$native" 2>&1)
+      printf '%s\n' "$info" | grep -Fq 'Authority=Developer ID Application:'
+      printf '%s\n' "$info" | grep -Fxq "TeamIdentifier=$team"
+      if [ "$native" = "$root/BililiveRecorder.Cli" ]; then
+        codesign --display --entitlements - "$native" > "$embedded"
+        python3 "$script_dir/verify-macos-cli-entitlements.py" "$embedded"
+        cli_signed=1
+      fi
+      ;;
+  esac
+done < "$manifest"
 test "$seen" -ge 2
+test "$cli_signed" -eq 1
 echo "Signed $seen native prepared sidecar files with Developer ID Application identity."

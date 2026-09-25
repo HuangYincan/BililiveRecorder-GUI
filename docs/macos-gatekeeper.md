@@ -66,3 +66,21 @@ passing PR build or Tauri updater signature as a Gatekeeper acceptance. A
 future corrected release needs a new shell version, independent review, all
 platform checks and explicit release authorization. Do not overwrite the
 existing public `2.20.3` tag/assets or ask users to bypass Gatekeeper/SIP.
+
+### Hardened-runtime CLI capability and startup proof
+
+The official .NET 8 signing fixture lists JIT among multiple broad debugging
+exceptions. This release deliberately gives **only**
+`com.apple.security.cs.allow-jit` to the managed CLI **apphost**, not
+`get-task-allow`, debugger, unsigned executable memory, arbitrary library
+validation bypass or DYLD environment access. All other embedded native dylibs
+and `createdump` are signed with the same team but no extra entitlements.
+The signing script and downloaded-DMG gate both parse the **embedded** CLI
+entitlements and reject any missing or additional keys. The release macOS
+matrix launches the signed CLI (`--version`) and the downloaded, copied app
+using the existing bounded normal-exit artifact test **only on the isolated
+hosted runner**. This is a proposed positive path, not an already completed
+Developer ID notarized run: no Apple certificate is currently available. If
+signed .NET actually needs another capability, measure that specific failure
+first and amend the entitlement set only after security review; never grant
+blanket debugging rights to make a test green.
