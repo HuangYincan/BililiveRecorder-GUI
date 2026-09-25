@@ -30,7 +30,22 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPROVED_SHA: ${{ inputs.approved_sha }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
+          # Updater minisign keys are NOT Apple Developer ID credentials.
+          # Refuse to create even a draft if the Apple notarization prerequisites
+          # have not been provisioned as repository Actions secrets.
+          for value in "$APPLE_CERTIFICATE" "$APPLE_CERTIFICATE_PASSWORD" "$APPLE_SIGNING_IDENTITY" "$APPLE_ID" "$APPLE_PASSWORD" "$APPLE_TEAM_ID"; do
+            if [ -z "$value" ]; then
+              echo "Apple Developer ID signing/notarization credentials are missing; release stopped before build" >&2
+              exit 1
+            fi
+          done
           if [ "$GITHUB_REF" != "refs/heads/main" ]; then
             echo "Release must target main" >&2
             exit 1
@@ -86,6 +101,12 @@ jobs:
       TAURI_TARGET_TRIPLE: ${{ matrix.target }}
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       APPIMAGE_EXTRACT_AND_RUN: "1"
       NO_STRIP: "1"
       RUST_BACKTRACE: "1"
@@ -110,6 +131,19 @@ jobs:
         shell: bash
         run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
       - run: npm run sidecar:prepare
+      # Tauri's bundle signature does not prove the .NET native resources are
+      # Developer ID signed. Import the same certificate before bundling and
+      # sign ALL native sidecar executables and dylibs on this disposable runner.
+      - name: Import Developer ID Application certificate
+        if: startsWith(matrix.platform, 'macos-26')
+        uses: apple-actions/import-codesign-certs@63fff01cd422d4b7b855d40ca1e9d34d2de9427d
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      - name: Sign native sidecar files before bundling
+        if: startsWith(matrix.platform, 'macos-26')
+        shell: bash
+        run: bash scripts/sign-macos-sidecar.sh "src-tauri/sidecar/${TAURI_TARGET_TRIPLE}" "$APPLE_SIGNING_IDENTITY" "$APPLE_TEAM_ID"
       - name: Verify Linux sidecar
         if: matrix.platform == 'ubuntu-22.04'
         run: |
@@ -177,6 +211,63 @@ jobs:
           updaterJsonPreferNsis: true
           args: -vv --target ${{ matrix.target }} --bundles appimage
 
+      - name: Reject public release if downloaded macOS DMG fails Gatekeeper
+        if: startsWith(matrix.platform, 'macos-26')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./package.json').version")
+          case "$TAURI_TARGET_TRIPLE" in
+            aarch64-apple-darwin) arch=aarch64 ;;
+            x86_64-apple-darwin) arch=x64 ;;
+            *) exit 1 ;;
+          esac
+          name="MikufansRecorder_${version}_darwin_${arch}.dmg"
+          mkdir -p macos-release-audit
+          gh release view "app-v${version}" --json assets > macos-release-audit/assets.json
+          NAME="$name" node -e '
+            const fs = require("node:fs");
+            const matches = JSON.parse(fs.readFileSync("macos-release-audit/assets.json")).assets.filter(a => a.name === process.env.NAME);
+            if (matches.length !== 1 || !/^sha256:[0-9a-f]{64}$/.test(matches[0].digest || "")) process.exit(1);
+            fs.writeFileSync("macos-release-audit/expected.sha", matches[0].digest.slice(7));
+          '
+          gh release download "app-v${version}" --pattern "$name" --dir macos-release-audit
+          test "$(shasum -a 256 "macos-release-audit/$name" | cut -d' ' -f1)" = "$(cat macos-release-audit/expected.sha)"
+          bash scripts/verify-macos-release-dmg.sh "macos-release-audit/$name" "$TAURI_TARGET_TRIPLE"
+      # Real runtime check only on an authorized, disposable hosted runner;
+      # mocks and successful codesign alone cannot prove hardened .NET starts.
+      - name: Launch signed CLI and downloaded app on isolated macOS runner
+        if: startsWith(matrix.platform, 'macos-26')
+        shell: bash
+        run: |
+          set -euo pipefail
+          cli="src-tauri/sidecar/${TAURI_TARGET_TRIPLE}/BililiveRecorder.Cli"
+          expected=$(node -p "require('./upstream.json').version.replace(/^v/, '')")
+          output=$("$cli" --version)
+          printf '%s\n' "$output"
+          printf '%s\n' "$output" | grep -Fq " $expected"
+          version=$(node -p "require('./package.json').version")
+          case "$TAURI_TARGET_TRIPLE" in
+            aarch64-apple-darwin) arch=aarch64 ;;
+            x86_64-apple-darwin) arch=x64 ;;
+            *) exit 1 ;;
+          esac
+          dmg="macos-release-audit/MikufansRecorder_${version}_darwin_${arch}.dmg"
+          mountpoint="$RUNNER_TEMP/signed-app-dmg"
+          mkdir -p "$mountpoint"
+          hdiutil attach -readonly -nobrowse -noautoopen -mountpoint "$mountpoint" "$dmg"
+          trap 'hdiutil detach "$mountpoint" || true' EXIT
+          ditto "$mountpoint/Mikufans录播姬.app" "$RUNNER_TEMP/signed-app.app"
+          hdiutil detach "$mountpoint"
+          trap - EXIT
+          export BILILIVE_ARTIFACT_APP="$RUNNER_TEMP/signed-app.app/Contents/MacOS/bililive-recorder-gui"
+          export BILILIVE_ARTIFACT_OK=1
+          export BILILIVE_ARTIFACT_EVIDENCE_DIR="$RUNNER_TEMP/signed-app-runtime-evidence"
+          mkdir -p "$BILILIVE_ARTIFACT_EVIDENCE_DIR"
+          cargo test --manifest-path src-tauri/Cargo.toml --test artifact_lifecycle \
+            quitting_the_app_stops_the_backend -- --ignored --exact --nocapture
       - name: Verify macOS bundle name and stable identifier
         if: startsWith(matrix.platform, 'macos-26')
         shell: bash
