@@ -55,7 +55,9 @@ while IFS= read -r -d '' native; do
       printf '%s\n' "$info" | grep -Fq 'Authority=Developer ID Application:'
       printf '%s\n' "$info" | grep -Fxq "TeamIdentifier=$APPLE_TEAM_ID"
       if [ "$native" = "$sidecar" ]; then
-        codesign --display --entitlements - "$native" > "$embedded"
+        # macOS 26 emits human-readable [Dict] for `--entitlements -`;
+        # `:-` exports XML for strict plist parsing (deprecated but fail-closed).
+        codesign --display --entitlements :- "$native" > "$embedded"
         python3 "$script_dir/verify-macos-cli-entitlements.py" "$embedded"
         cli_checked=1
       fi
