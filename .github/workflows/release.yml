@@ -127,6 +127,8 @@ jobs:
             This release bundles the matching official BililiveRecorder CLI and its embedded upstream WebUI.
 
             Upstream release metadata is recorded in `upstream.json`.
+
+            macOS builds use free ad-hoc code signing. They are not Apple Developer ID signed or notarized; Gatekeeper may block first launch.
           releaseDraft: true
           prerelease: false
           assetNamePattern: MikufansRecorder_[version]_[platform]_[arch][setup][ext]
@@ -147,6 +149,8 @@ jobs:
             This release bundles the matching official BililiveRecorder CLI and its embedded upstream WebUI.
 
             Upstream release metadata is recorded in `upstream.json`.
+
+            macOS builds use free ad-hoc code signing. They are not Apple Developer ID signed or notarized; Gatekeeper may block first launch.
           releaseDraft: true
           prerelease: false
           assetNamePattern: MikufansRecorder_[version]_[platform]_[arch][setup][ext]
@@ -169,6 +173,8 @@ jobs:
             This release bundles the matching official BililiveRecorder CLI and its embedded upstream WebUI.
 
             Upstream release metadata is recorded in `upstream.json`.
+
+            macOS builds use free ad-hoc code signing. They are not Apple Developer ID signed or notarized; Gatekeeper may block first launch.
           releaseDraft: true
           prerelease: false
           assetNamePattern: MikufansRecorder_[version]_[platform]_[arch][setup][ext]
@@ -177,6 +183,47 @@ jobs:
           updaterJsonPreferNsis: true
           args: -vv --target ${{ matrix.target }} --bundles appimage
 
+      - name: Verify exact uploaded macOS DMG and updater signatures
+        if: startsWith(matrix.platform, 'macos-26')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./package.json').version")
+          case "$TAURI_TARGET_TRIPLE" in
+            aarch64-apple-darwin) arch=aarch64 ;;
+            x86_64-apple-darwin) arch=x64 ;;
+            *) exit 1 ;;
+          esac
+          mkdir -p macos-release-audit
+          for suffix in dmg app.tar.gz; do
+            name="MikufansRecorder_${version}_darwin_${arch}.${suffix}"
+            gh release view "app-v${version}" --json assets > macos-release-audit/assets.json
+            NAME="$name" node --input-type=module -e '
+              import fs from "node:fs";
+              const assets = JSON.parse(fs.readFileSync("macos-release-audit/assets.json")).assets;
+              const matches = assets.filter(a => a.name === process.env.NAME);
+              if (matches.length !== 1 || !/^sha256:[0-9a-f]{64}$/.test(matches[0].digest || "")) process.exit(1);
+              fs.writeFileSync("macos-release-audit/expected.sha", matches[0].digest.slice(7));
+            '
+            gh release download "app-v${version}" --pattern "$name" --dir macos-release-audit
+            test "$(shasum -a 256 "macos-release-audit/$name" | cut -d' ' -f1)" = "$(cat macos-release-audit/expected.sha)"
+            bash scripts/verify-macos-release.sh "macos-release-audit/$name" "$TAURI_TARGET_TRIPLE"
+          done
+      - name: Verify downloaded macOS app starts and stops its backend
+        if: startsWith(matrix.platform, 'macos-26')
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/release-runtime"
+          tar -xzf macos-release-audit/*.app.tar.gz -C "$RUNNER_TEMP/release-runtime"
+          export BILILIVE_ARTIFACT_APP="$RUNNER_TEMP/release-runtime/Mikufans录播姬.app/Contents/MacOS/bililive-recorder-gui"
+          export BILILIVE_ARTIFACT_OK=1
+          export BILILIVE_ARTIFACT_EVIDENCE_DIR="$RUNNER_TEMP/release-runtime-evidence"
+          mkdir -p "$BILILIVE_ARTIFACT_EVIDENCE_DIR"
+          cargo test --manifest-path src-tauri/Cargo.toml --test artifact_lifecycle \
+            quitting_the_app_stops_the_backend -- --ignored --exact --nocapture
       - name: Verify macOS bundle name and stable identifier
         if: startsWith(matrix.platform, 'macos-26')
         shell: bash

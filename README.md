@@ -94,7 +94,7 @@ BILILIVE_RECORDER_VERSION=v2.20.0 npm run sidecar:prepare
 - **平台代码的验证程度**：`platform.rs` 可通过独立最小 crate 做 macOS/Linux/Windows 类型检查；原生 API 行为需实际 runner 验证。`artifact_lifecycle.rs` 的真实产物用例默认 ignored，只能在可丢弃 runner/VM 显式启用。正常退出、强杀、日志和文件完整性是独立判据。
 - 安装包和退出证据逐个目标、逐个 SHA 记录；任何未验证平台或失败步骤都不能因其他 job 通过而视为通过。
 - sidecar 下载依赖 GitHub Release；正式发布应同时保存资产校验值并对桌面安装包签名/公证。
-- Tauri updater 包已有独立签名链；macOS Developer ID 签名与 Apple 公证仍需仓库所有者提供 Apple 凭据。
+- macOS 安装包采用免费的 ad-hoc 自签名：主程序、内嵌 CLI 和原生动态库均签名，封装后验证资源封印、DMG 与自动更新包中的实际签名，并在隔离 runner 验证启动。它不含 Apple Developer ID 签名或公证，首次打开仍可能被 Gatekeeper 拦截。Tauri updater 的独立签名用于验证自动更新来源。
 - 应用不向局域网开放后端，也没有提供修改监听地址的入口。
 
 ## 许可证
