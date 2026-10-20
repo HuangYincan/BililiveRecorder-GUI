@@ -46,6 +46,9 @@ jobs:
       - name: Verify official white-background branding and stable update identity
         run: npm run brand:verify
       - run: npm run desktop:version-test
+      - name: Test real macOS signature verification and tamper rejection
+        if: startsWith(matrix.platform, 'macos-26')
+        run: bash scripts/test-macos-signatures.sh
       - name: Test package verifier against cross-platform fixtures
         run: node --test scripts/verify-packaged-sidecar.test.mjs
       - run: npm run sidecar:prepare
@@ -74,6 +77,15 @@ jobs:
         run: >-
           npm run tauri build -- -vv --target ${{ matrix.target }} --bundles appimage
           --config '{"bundle":{"createUpdaterArtifacts":false}}'
+      - name: Verify macOS ad-hoc signatures in the packaged DMG
+        if: startsWith(matrix.platform, 'macos-26')
+        timeout-minutes: 12
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg=$(find "src-tauri/target/${{ matrix.target }}/release/bundle/dmg" -name '*.dmg' -print -quit)
+          test -n "$dmg"
+          bash scripts/verify-macos-release.sh "$dmg" "$TAURI_TARGET_TRIPLE"
       - name: Smoke-test CLI executable extracted from the built desktop package
         timeout-minutes: 12
         run: npm run bundle:smoke

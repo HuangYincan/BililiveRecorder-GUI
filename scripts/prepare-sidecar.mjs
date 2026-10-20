@@ -25,7 +25,14 @@ const extension = target.includes('windows') ? '.exe' : '';
 const sidecarRoot = join('src-tauri', 'sidecar');
 const outputDirectory = join(sidecarRoot, target);
 const output = join(outputDirectory, `BililiveRecorder.Cli${extension}`);
+function signMacosSidecar() {
+  if (target.includes('apple-darwin')) {
+    if (process.platform !== 'darwin') throw new Error('macOS signing requires a macOS builder');
+    execFileSync('bash', ['scripts/sign-macos-sidecar.sh', outputDirectory], { stdio: 'inherit' });
+  }
+}
 if (existsSync(output) && process.env.FORCE_SIDECAR_DOWNLOAD !== '1') {
+  signMacosSidecar();
   console.log(`Sidecar already prepared: ${output}`);
   process.exit(0);
 }
@@ -48,4 +55,5 @@ if (target.includes('linux')) {
 }
 if (!extension) chmodSync(output, 0o755);
 rmSync(archivePath, { force: true });
+signMacosSidecar();
 console.log(`Prepared ${output}`);
