@@ -39,6 +39,17 @@ test('real failed 2.20.2 GitHub draft asset names reproduce the Unicode normaliz
   assert.throws(() => verifyUploadedReleaseAssets(actual(names), version, sha), /Release asset identity mismatch/);
 });
 
+test('packages are verified before the sole publisher creates the manifest, then the complete set is required', () => {
+  const names = releaseAssetNames(version).all;
+  const packages = names.filter((name) => name !== 'latest.json');
+  const beforeManifest = { requireManifest: false };
+  assert.deepEqual(verifyUploadedReleaseAssets(actual(packages), version, sha, beforeManifest), packages);
+  assert.throws(() => verifyUploadedReleaseAssets(actual(packages), version, sha), /missing=latest.json/);
+  // A retry may retain the manifest, but must still reject a missing package signature.
+  assert.deepEqual(verifyUploadedReleaseAssets(actual(names), version, sha, beforeManifest), names);
+  assert.throws(() => verifyUploadedReleaseAssets(actual(packages.filter((name) => !name.endsWith('.sig'))), version, sha, beforeManifest), /identity mismatch/);
+});
+
 test('a unique wrong product, a collision, missing signature and wrong build identity fail closed', () => {
   const names = releaseAssetNames(version).all;
   const wrong = [...names];

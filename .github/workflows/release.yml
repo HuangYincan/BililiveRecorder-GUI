@@ -115,6 +115,8 @@ jobs:
         run: |
           test ! -e src-tauri/sidecar/${{ matrix.target }}/libcoreclrtraceptprovider.so
           src-tauri/sidecar/${{ matrix.target }}/BililiveRecorder.Cli --version
+      # Only the final publish job writes latest.json. Matrix uploads race if
+      # tauri-action also tries to merge and replace this shared asset.
       # Fixed upstream action: getAssetName uses [version]/[platform]/[arch]/[setup]/[ext].
       - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5
         if: matrix.platform != 'ubuntu-22.04'
@@ -133,7 +135,7 @@ jobs:
           prerelease: false
           assetNamePattern: MikufansRecorder_[version]_[platform]_[arch][setup][ext]
           retryAttempts: 3
-          includeUpdaterJson: true
+          includeUpdaterJson: false
           updaterJsonPreferNsis: true
           args: -vv --target ${{ matrix.target }}
 
@@ -155,7 +157,7 @@ jobs:
           prerelease: false
           assetNamePattern: MikufansRecorder_[version]_[platform]_[arch][setup][ext]
           retryAttempts: 3
-          includeUpdaterJson: true
+          includeUpdaterJson: false
           updaterJsonPreferNsis: true
           args: >-
             -vv --target ${{ matrix.target }} --bundles deb,rpm
@@ -179,7 +181,7 @@ jobs:
           prerelease: false
           assetNamePattern: MikufansRecorder_[version]_[platform]_[arch][setup][ext]
           retryAttempts: 3
-          includeUpdaterJson: true
+          includeUpdaterJson: false
           updaterJsonPreferNsis: true
           args: -vv --target ${{ matrix.target }} --bundles appimage
 
@@ -302,7 +304,7 @@ jobs:
           VERSION=$(node -p "require('./package.json').version")
           mkdir -p release-audit
           gh release view "app-v${VERSION}" --json tagName,isDraft,targetCommitish,assets > release-audit/draft.json
-          node scripts/verify-uploaded-release-assets.mjs release-audit/draft.json "$VERSION" "$GITHUB_SHA"
+          node scripts/verify-uploaded-release-assets.mjs release-audit/draft.json "$VERSION" "$GITHUB_SHA" --before-manifest
       - name: Establish new tag and verify it resolves to the actual build commit
         run: bash scripts/ensure-release-tag.sh
       - name: Validate updater assets and signatures
@@ -316,6 +318,8 @@ jobs:
           npm run release:manifest -- release-audit/assets.json release-audit/signatures release-audit/latest.json
           gh release upload "app-v${VERSION}" release-audit/latest.json --clobber
           npm run release:validate -- release-audit/latest.json release-audit/assets.json release-audit/signatures
+          gh release view "app-v${VERSION}" --json tagName,isDraft,targetCommitish,assets > release-audit/complete.json
+          node scripts/verify-uploaded-release-assets.mjs release-audit/complete.json "$VERSION" "$GITHUB_SHA"
       - name: Publish draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
