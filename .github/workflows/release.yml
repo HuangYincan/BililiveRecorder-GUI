@@ -185,6 +185,7 @@ jobs:
 
       - name: Verify exact uploaded macOS DMG and updater signatures
         if: startsWith(matrix.platform, 'macos-26')
+        timeout-minutes: 12
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -213,6 +214,7 @@ jobs:
           done
       - name: Verify downloaded macOS app starts and stops its backend
         if: startsWith(matrix.platform, 'macos-26')
+        timeout-minutes: 12
         shell: bash
         run: |
           set -euo pipefail

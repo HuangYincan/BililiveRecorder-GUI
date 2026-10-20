@@ -79,6 +79,7 @@ jobs:
           --config '{"bundle":{"createUpdaterArtifacts":false}}'
       - name: Verify macOS ad-hoc signatures in the packaged DMG
         if: startsWith(matrix.platform, 'macos-26')
+        timeout-minutes: 12
         shell: bash
         run: |
           set -euo pipefail

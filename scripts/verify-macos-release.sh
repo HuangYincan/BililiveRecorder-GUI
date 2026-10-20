@@ -32,7 +32,10 @@ esac
 bash "$script_dir/verify-macos-signatures.sh" "$app" "$target"
 cli="$app/Contents/Resources/sidecar/$target/BililiveRecorder.Cli"
 expected=$(node -p "require('./upstream.json').version.replace(/^v/, '')")
-actual=$("$cli" --version)
+actual=$(node --input-type=module -e '
+  import { execFileSync } from "node:child_process";
+  process.stdout.write(execFileSync(process.argv[1], ["--version"], { encoding: "utf8", timeout: 60_000 }).trim());
+' "$cli")
 case "$actual" in
   "$expected"|"$expected"+*) ;;
   *) echo "Packaged CLI version mismatch: $actual" >&2; exit 1 ;;
